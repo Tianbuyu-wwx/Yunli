@@ -29,30 +29,6 @@
     "default": "",
     "hint": "在系统提示词后追加自定义内容"
   },
-  "response_mode": {
-    "description": "【群聊行为】响应模式",
-    "type": "string",
-    "default": "balanced",
-    "options": ["quiet", "balanced", "active"],
-    "hint": "quiet=只回应@，balanced=标准模式，active=主动模式"
-  },
-  "mention_window_seconds": {
-    "description": "【群聊行为】多人同时@收集窗口(秒)",
-    "type": "int",
-    "default": 3,
-    "hint": "3秒内多人@云璃时，随机选一条回复，其他发送忙不过来提示",
-    "slider": {
-      "min": 1,
-      "max": 10,
-      "step": 1
-    }
-  },
-  "mention_busy_response": {
-    "description": "【群聊行为】多人@时发送忙不过来提示",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，被跳过的人会收到等一下的提示"
-  },
   "max_message_length": {
     "description": "【群聊行为】单条消息最大长度",
     "type": "int",

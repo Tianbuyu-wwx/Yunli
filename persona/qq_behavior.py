@@ -11,7 +11,6 @@ class QQBehaviorManager:
 
         # 基础配置
         self.use_qq_emoji = self.config.get("use_qq_emoji", True)
-        self.response_mode = self.config.get("response_mode", "balanced")
 
     def format_for_qq(
         self, text: str, is_at_me: bool = False, user_nickname: str = ""
@@ -65,16 +64,10 @@ class QQBehaviorManager:
             text_length: 回复文本长度，用于计算打字时间
         """
         # 基础反应时间（看到消息到开始打字）
-        if self.response_mode == "active":
-            base_delay = random.uniform(
-                self.config.get("active_min_delay", 0.3),
-                self.config.get("active_max_delay", 1.0)
-            )
-        else:
-            base_delay = random.uniform(
-                self.config.get("normal_min_delay", 0.8),
-                self.config.get("normal_max_delay", 2.0)
-            )
+        base_delay = random.uniform(
+            self.config.get("normal_min_delay", 0.8),
+            self.config.get("normal_max_delay", 2.0)
+        )
 
         # 模拟打字时间（假设每秒打5-8个字）
         if text_length > 0:
