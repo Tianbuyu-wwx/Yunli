@@ -1,0 +1,138 @@
+"""云璃插件 - 通用工具函数
+
+集中管理所有纯工具函数，消除 main.py 和 persona/core.py 中的重复代码。
+不依赖任何插件内部状态，纯函数或仅有参数依赖。
+"""
+
+import re
+from typing import List, Optional
+
+
+def estimate_tokens(text: str) -> int:
+    """估算文本 Token 数（1 Token ≈ 2 个中文字符）
+
+    用于 Token 预算控制，替代各处重复的 len(text) // 2。
+    """
+    return len(text) // 2
+
+
+def truncate_at_sentence(text: str, max_len: int, min_lookback: int = 15) -> str:
+    """在句子结束标点处截断文本，保持自然
+
+    向后查找最近的句子结束标点进行截断。
+    如果没找到合适的截断点，在 max_len 处硬截断。
+
+    Args:
+        text: 待截断文本
+        max_len: 最大长度
+        min_lookback: 最小回溯长度，避免截断太靠近开头
+
+    Returns:
+        截断后的文本
+    """
+    if len(text) <= max_len:
+        return text
+
+    truncate_pos = max_len
+    lookback_start = max(max_len - min_lookback, 0)
+    for i in range(max_len, lookback_start, -1):
+        if i < len(text) and text[i] in '。！？.!?…':
+            truncate_pos = i + 1
+            break
+
+    return text[:truncate_pos]
+
+
+def truncate_at_sentence_forward(text: str, max_len: int, min_lookback: int = 15) -> str:
+    """向前查找句子结束标点截断（别名，兼容不同使用场景）"""
+    return truncate_at_sentence(text, max_len, min_lookback)
+
+
+def merge_messages(messages: List[str], max_messages: int = 10) -> str:
+    """合并多条消息（用于消息防抖合并）
+
+    Args:
+        messages: 消息文本列表
+        max_messages: 最大合并条数
+
+    Returns:
+        合并后的消息文本
+    """
+    if not messages:
+        return ""
+
+    if len(messages) <= 1:
+        return messages[0]
+
+    # 限制合并条数，避免 prompt 膨胀
+    limited = messages[-max_messages:]
+    notice = f"[用户连续发送了{len(limited)}条消息，已合并理解]\n"
+    return notice + "\n".join(limited)
+
+
+# ========== 文本清理相关 ==========
+
+LEADING_ASSISTANT_PREFIXES = [
+    "好的，", "好的!", "好的。", "好的~",
+    "当然，", "当然!", "当然。",
+    "以下是", "以下是我", "作为AI", "作为一个AI",
+    "我理解", "我明白了", "让我来",
+    "没问题，", "没问题!", "没问题。",
+    "非常抱歉，", "很抱歉，",
+]
+
+INTERNAL_STATE_KEYWORDS = [
+    "记忆模块", "提示词", "系统指令", "系统提示",
+    "prompt", "system prompt", "配置项",
+    "数据库查询", "知识库", "缓存",
+    "作为AI助手", "作为人工智能",
+]
+
+
+def remove_assistant_prefix(text: str) -> str:
+    """去除 LLM 常见的助手腔开头"""
+    for prefix in LEADING_ASSISTANT_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip()
+            if text and text[0].isascii() and text[0].islower():
+                text = text[0].upper() + text[1:]
+            break
+    return text
+
+
+def remove_internal_state_lines(text: str) -> str:
+    """移除泄露内部状态的行"""
+    for kw in INTERNAL_STATE_KEYWORDS:
+        if kw.lower() in text.lower():
+            sentences = re.split(r'([。！？.?!]+)', text)
+            new_sentences = []
+            i = 0
+            while i < len(sentences):
+                segment = sentences[i]
+                if not any(kw.lower() in segment.lower() for kw in INTERNAL_STATE_KEYWORDS):
+                    new_sentences.append(segment)
+                elif i + 1 < len(sentences) and re.match(r'[。！？.?!]+', sentences[i + 1]):
+                    i += 1
+                i += 1
+            text = "".join(new_sentences).strip()
+            break
+    return text
+
+
+def clean_repeated_punctuation(text: str) -> str:
+    """清理重复标点"""
+    return re.sub(r'([。！？，、])\1{3,}', r'\1\1', text)
+
+
+def is_structured_summary(text: str) -> bool:
+    """检测是否为结构化总结（Markdown标题/编号列表/粗体/分隔线）
+
+    用于判断 LLM 输出是否为结构化内容，不同场景下采用不同的过滤策略。
+    """
+    if len(text) < 100:
+        return False
+    has_heading = bool(re.search(r'(^|\n)\s*#{2,6}\s+', text))
+    has_numbered_list = bool(re.search(r'(^|\n)\s*\d+\.\s+', text))
+    has_bold = bool(re.search(r'\*\*[^*]+\*\*', text))
+    has_separator = bool(re.search(r'(^|\n)\s*---+\s*(\n|$)', text))
+    return has_heading or has_numbered_list or (has_bold and has_numbered_list) or has_separator

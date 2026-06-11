@@ -1,0 +1,14 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+*.egg-info/
+
+# 运行时数据库文件（用户数据，不应提交）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+tests/

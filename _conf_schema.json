@@ -1,0 +1,396 @@
+{
+  "persona_intensity": {
+    "description": "【基础人格】人格强度",
+    "type": "int",
+    "default": 80,
+    "hint": "控制云璃人格特征的明显程度，1-100",
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 10
+    }
+  },
+  "strict_identity": {
+    "description": "【基础人格】严格身份保持",
+    "type": "bool",
+    "default": true,
+    "hint": "严格保持云璃身份，拒绝承认是AI"
+  },
+  "modern_analogy_mode": {
+    "description": "【基础人格】现代概念类比模式",
+    "type": "string",
+    "default": "funny",
+    "options": ["off", "funny", "serious"],
+    "hint": "云璃如何理解现代概念：off=正常理解，funny=有趣类比，serious=严肃类比"
+  },
+  "custom_prompt_append": {
+    "description": "【基础人格】自定义提示词追加",
+    "type": "string",
+    "default": "",
+    "hint": "在系统提示词后追加自定义内容"
+  },
+  "response_mode": {
+    "description": "【群聊行为】响应模式",
+    "type": "string",
+    "default": "balanced",
+    "options": ["quiet", "balanced", "active"],
+    "hint": "quiet=只回应@，balanced=标准模式，active=主动模式"
+  },
+  "mention_window_seconds": {
+    "description": "【群聊行为】多人同时@收集窗口(秒)",
+    "type": "int",
+    "default": 3,
+    "hint": "3秒内多人@云璃时，随机选一条回复，其他发送忙不过来提示",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "mention_busy_response": {
+    "description": "【群聊行为】多人@时发送忙不过来提示",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，被跳过的人会收到等一下的提示"
+  },
+  "max_message_length": {
+    "description": "【群聊行为】单条消息最大长度",
+    "type": "int",
+    "default": 200,
+    "hint": "超过此长度会截断，避免QQ群刷屏"
+  },
+  "max_text_length": {
+    "description": "【群聊行为】单条回复最大长度",
+    "type": "int",
+    "default": 1200,
+    "hint": "回复文本超过此长度会被截断（知识查询模式默认1200，聊天模式受message_splitter_max_segment_length控制）",
+    "slider": {
+      "min": 200,
+      "max": 4000,
+      "step": 100
+    }
+  },
+  "at_reply_probability": {
+    "description": "【群聊行为】@回复概率",
+    "type": "float",
+    "default": 0.5,
+    "hint": "被@时使用@回复的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "emotion_max_duration": {
+    "description": "【情感与语气】情感状态最大持续轮数",
+    "type": "int",
+    "default": 3,
+    "hint": "同一情感状态最多持续多少轮对话后自动衰减",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "emotion_particle_probability": {
+    "description": "【情感与语气】情感语气词添加概率",
+    "type": "float",
+    "default": 0.2,
+    "hint": "回复中添加情感语气词的基础概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "food_exclamation_probability": {
+    "description": "【情感与语气】食物话题感叹追加概率",
+    "type": "float",
+    "default": 0.3,
+    "hint": "聊到食物时追加感叹句的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "avoidance_probability": {
+    "description": "【情感与语气】回避话题概率",
+    "type": "float",
+    "default": 0.7,
+    "hint": "遇到悲伤话题时转移话题的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "use_qq_emoji": {
+    "description": "【情感与语气】使用QQ表情",
+    "type": "bool",
+    "default": true,
+    "hint": "在回复中随机添加QQ表情符号"
+  },
+  "kaomoji_probability": {
+    "description": "【情感与语气】颜文字添加概率",
+    "type": "float",
+    "default": 0.15,
+    "hint": "在回复中添加颜文字的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "skip_punctuation_probability": {
+    "description": "【情感与语气】省略标点概率",
+    "type": "float",
+    "default": 0.1,
+    "hint": "句末省略标点的概率，模拟真人习惯(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "typing_pause_probability": {
+    "description": "【情感与语气】打字停顿概率",
+    "type": "float",
+    "default": 0.3,
+    "hint": "长消息中添加省略号停顿的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "remember_users": {
+    "description": "【记忆系统】记住群友",
+    "type": "bool",
+    "default": true,
+    "hint": "记录群友互动历史，对熟人态度不同"
+  },
+  "lightweight_extraction_enabled": {
+    "description": "【记忆系统】启用轻量级记忆提取",
+    "type": "bool",
+    "default": true,
+    "hint": "实时正则提取高频简单模式（我喜欢/我是/我在），零Token成本"
+  },
+  "memory_llm_enabled": {
+    "description": "【记忆系统】启用LLM深度记忆整理",
+    "type": "bool",
+    "default": true,
+    "hint": "定时调用LLM批量整理对话，提取复杂记忆"
+  },
+  "llm_consolidation_hours": {
+    "description": "【记忆系统】LLM记忆整理间隔(小时)",
+    "type": "int",
+    "default": 3,
+    "hint": "每隔几小时触发一次LLM深度整理（实际会根据聊天密度自动降低至1-3小时）",
+    "slider": {
+      "min": 1,
+      "max": 24,
+      "step": 1
+    }
+  },
+  "llm_consolidation_min_dialogues": {
+    "description": "【记忆系统】LLM整理最小对话数",
+    "type": "int",
+    "default": 15,
+    "hint": "积累多少条对话后才触发LLM整理（实际会根据聊天密度自动降低至5-15条）",
+    "slider": {
+      "min": 5,
+      "max": 100,
+      "step": 5
+    }
+  },
+  "max_memories_per_user": {
+    "description": "【记忆系统】单用户最大记忆数量",
+    "type": "int",
+    "default": 50,
+    "hint": "每个用户最多保留多少条记忆，超过时触发LLM整理",
+    "slider": {
+      "min": 10,
+      "max": 200,
+      "step": 10
+    }
+  },
+  "memory_consolidation_trigger_threshold": {
+    "description": "【记忆系统】记忆整理触发阈值",
+    "type": "int",
+    "default": 45,
+    "hint": "当记忆数量达到此值时触发LLM整理（应略低于上限）",
+    "slider": {
+      "min": 5,
+      "max": 195,
+      "step": 5
+    }
+  },
+  "max_knowledge_sentences": {
+    "description": "【知识查询】知识查询最大句数",
+    "type": "int",
+    "default": 3,
+    "hint": "知识查询模式下回复最多包含多少句话",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "knowledge_max_text_length": {
+    "description": "【知识查询】知识查询最大文本长度",
+    "type": "int",
+    "default": 4000,
+    "hint": "知识查询模式下单条回复的最大字符数（表格/数据需要更大空间）",
+    "slider": {
+      "min": 1000,
+      "max": 8000,
+      "step": 500
+    }
+  },
+  "force_segmented_reply": {
+    "description": "【分段回复】启用智能分段回复",
+    "type": "bool",
+    "default": true,
+    "hint": "启用插件自带的智能分段对话（建议关闭AstrBot自带分段回复）"
+  },
+  "message_splitter_max_segment_length": {
+    "description": "【分段回复】单条最大长度",
+    "type": "int",
+    "default": 180,
+    "hint": "单条消息最大字符数，超过则切分",
+    "slider": {
+      "min": 50,
+      "max": 300,
+      "step": 10
+    }
+  },
+  "message_splitter_min_segment_length": {
+    "description": "【分段回复】最小段长度",
+    "type": "int",
+    "default": 10,
+    "hint": "避免切分过碎的最小长度",
+    "slider": {
+      "min": 5,
+      "max": 50,
+      "step": 5
+    }
+  },
+  "message_splitter_enable_typing_delay": {
+    "description": "【分段回复】启用打字延迟",
+    "type": "bool",
+    "default": true,
+    "hint": "模拟真人打字节奏，分段间添加延迟"
+  },
+  "message_splitter_base_delay": {
+    "description": "【分段回复】基础延迟(秒)",
+    "type": "float",
+    "default": 0.5,
+    "hint": "每条消息的基础发送延迟",
+    "slider": {
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1
+    }
+  },
+  "message_splitter_delay_per_char": {
+    "description": "【分段回复】每字延迟(秒)",
+    "type": "float",
+    "default": 0.03,
+    "hint": "每个字符增加的延迟时间",
+    "slider": {
+      "min": 0.0,
+      "max": 0.1,
+      "step": 0.01
+    }
+  },
+  "message_splitter_max_delay": {
+    "description": "【分段回复】最大延迟(秒)",
+    "type": "float",
+    "default": 3.0,
+    "hint": "单条消息的最大延迟上限",
+    "slider": {
+      "min": 1.0,
+      "max": 10.0,
+      "step": 0.5
+    }
+  },
+  "message_splitter_enable_thinking_pause": {
+    "description": "【分段回复】启用思考停顿",
+    "type": "bool",
+    "default": true,
+    "hint": "在段落间添加…嗯…等思考停顿"
+  },
+  "message_splitter_thinking_pause_prob": {
+    "description": "【分段回复】思考停顿概率",
+    "type": "float",
+    "default": 0.3,
+    "hint": "添加思考停顿的概率(0-1)",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "message_splitter_enable_natural_break": {
+    "description": "【分段回复】启用语气词切分",
+    "type": "bool",
+    "default": true,
+    "hint": "在不过/但是/而且等词后切分，更像真人说话"
+  },
+  "max_cache_size": {
+    "description": "【性能优化】提示词缓存最大条数",
+    "type": "int",
+    "default": 100,
+    "hint": "缓存提示词避免重复构建，越大占用内存越多",
+    "slider": {
+      "min": 10,
+      "max": 500,
+      "step": 10
+    }
+  },
+  "relationship_decay_multiplier": {
+    "description": "【关系状态】状态衰减时间倍数",
+    "type": "float",
+    "default": 1.0,
+    "hint": "关系状态自动恢复的时间倍数(0.5=加速恢复，2.0=延长持续时间)。backoff默认6小时、careful默认2小时、warming默认30分钟后自动恢复",
+    "slider": {
+      "min": 0.1,
+      "max": 3.0,
+      "step": 0.1
+    }
+  },
+  "prompt_inject_timeout": {
+    "description": "【性能优化】人格注入超时(秒)",
+    "type": "int",
+    "default": 10,
+    "hint": "控制云璃人格提示词注入的最大等待时间，超时则跳过本轮回调（不会阻塞消息）",
+    "slider": {
+      "min": 3,
+      "max": 30,
+      "step": 1
+    }
+  },
+  "buffer_task_debounce_seconds": {
+    "description": "【记忆系统】记忆缓冲任务防抖(秒)",
+    "type": "int",
+    "default": 60,
+    "hint": "控制LLM深度整理的缓冲任务创建频率，避免每条消息都创建后台异步任务",
+    "slider": {
+      "min": 10,
+      "max": 300,
+      "step": 10
+    }
+  },
+  "memory_buffer_max_size": {
+    "description": "【记忆系统】对话缓冲队列上限",
+    "type": "int",
+    "default": 2000,
+    "hint": "LLM深度整理的对话缓冲队列最大长度（基于asyncio.Queue，满时丢弃新消息防内存泄漏）",
+    "slider": {
+      "min": 500,
+      "max": 5000,
+      "step": 500
+    }
+  }
+}

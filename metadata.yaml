@@ -1,0 +1,11 @@
+name: astrbot_plugin_yunli_persona
+display_name: 云璃QQ群聊人格插件
+short_desc: "让云璃成为你的QQ群友，支持人格模仿、群聊记忆。"
+desc: "让AI化身朱明仙舟的猎剑士云璃，成为你的QQ群友。支持人格模仿、现代概念类比、群聊记忆等功能。"
+version: 1.6.0
+author: YunliDev
+repo: https://github.com/yourname/astrbot_plugin_yunli_persona
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
