@@ -3,48 +3,24 @@ import re
 from typing import Dict, List, Optional
 
 from . import filters
-
-
-# ========== 共享关键词常量（单一数据源）==========
-# 其他模块（emotion.py、qq_behavior.py）通过 from .language import ... 引用
-# 避免关键词在多个模块中独立维护导致不一致
-
-# 剑相关关键词
-SWORD_KEYWORDS = [
-    "剑", "刀", "武器", "锻", "老铁", "魔剑",
-    "剑意", "剑心", "剑法", "剑器",
-]
-
-# 食物相关关键词
-FOOD_KEYWORDS = [
-    "吃", "饭", "食物", "琼实", "鸟串", "肉龙",
-    "糖藕", "饿", "零食", "好吃", "美味",
-]
-
-# 云璃相关关键词
-YUNLI_KEYWORDS = ["云璃", "yunli", "猎剑士", "小云璃"]
-
-# 玩乐/玩笑关键词
-PLAY_KEYWORDS = ["哈哈", "好玩", "搞笑", "逗", "梗", "嘿嘿", "乐", "嘻嘻"]
-
-# 亲密关键词
-INTIMACY_KEYWORDS = ["贴贴", "想你了", "爱你", "么么", "抱抱", "亲亲", "蹭蹭"]
-
-# 求助关键词
-HELP_KEYWORDS = ["帮我", "求助", "请教", "教教我", "怎么做", "怎么办", "不会"]
-
-# 现代概念关键词（用于类比查询）
-MODERN_TERMS = [
-    "手机", "电脑", "游戏", "网络", "直播", "视频",
-    "外卖", "快递", "二次元", "微信", "QQ", "抖音",
-    "b站", "淘宝", "京东", "支付宝", "地铁", "高铁",
-    "空调", "冰箱", "洗衣机", "电视", "电影", "音乐",
-    "拍照", "扫码",
-]
+from .config import (
+    SWORD_KEYWORDS,
+    FOOD_KEYWORDS,
+    YUNLI_KEYWORDS,
+    PLAY_KEYWORDS,
+    INTIMACY_KEYWORDS,
+    HELP_KEYWORDS,
+    MODERN_TERMS,
+    STYLE_MODULATION,
+    RELATIONSHIP_MODES,
+)
 
 
 class LanguageStyleProcessor:
     """云璃语言风格处理器"""
+
+    # 向后兼容：保留类属性引用，避免外部通过 LanguageStyleProcessor.STYLE_MODULATION 访问失效
+    STYLE_MODULATION = STYLE_MODULATION
 
     TOPIC_PATTERNS = {
         "sword": list(SWORD_KEYWORDS),
@@ -66,20 +42,6 @@ class LanguageStyleProcessor:
         ],
         "greeting": ["你好", "嗨", "在吗", "早上好", "晚上好", "晚安"],
         "farewell": ["再见", "拜拜", "走了", "下线", "睡觉"],
-    }
-
-    # 按话题动态长度限制（聊天模式）
-    # 减少字数 → 更少分段 → 降低刷屏概率
-    TOPIC_MAX_LENGTH = {
-        "greeting": 60,    # 问候/告别 — 简单回应
-        "farewell": 60,    # 同上
-        "general": 120,    # 日常闲聊 — 一句话足矣
-        "combat": 120,     # 战斗话题 — 简短过招
-        "emotion": 120,    # 情感话题 — 关心不需要长篇
-        "family": 100,     # 家庭话题 — 回避型，短为宜
-        "modern": 120,     # 现代概念 — 类比一句带过
-        "food": 140,       # 食物 — 可以多说一点点
-        "sword": 160,      # 剑 — 剑痴可以多说两句
     }
 
     # 云璃常用语气词（贴合人设：朱明猎剑士、傲娇、直率、古代少女）
@@ -302,7 +264,8 @@ class LanguageStyleProcessor:
         return "chat"
 
     def apply_style(
-        self, text: str, emotion_state: str = "neutral", mode: str = "auto", is_first_segment: bool = True
+        self, text: str, emotion_state: str = "neutral", mode: str = "auto",
+        is_first_segment: bool = True, relationship_mode: str = "normal",
     ) -> str:
         """应用云璃语言风格
 
@@ -315,6 +278,8 @@ class LanguageStyleProcessor:
             text: 要处理的文本
             emotion_state: 情感状态
             mode: 模式，'auto'自动检测，'knowledge_query'知识查询，'chat'普通聊天
+            is_first_segment: 是否为第一段（后续片段不加语气词）
+            relationship_mode: 关系模式（normal/backoff/careful/warming），影响语气词和颜文字概率
         """
         # 自动检测模式
         if mode == "auto":
@@ -331,23 +296,26 @@ class LanguageStyleProcessor:
             return text
 
         # ========== 聊天模式：完整风格处理 ==========
-        # 根据话题应用不同风格
+        # 获取关系等级驱动的风格调制参数
+        style_mod = self.STYLE_MODULATION.get(relationship_mode, self.STYLE_MODULATION["normal"])
+
+        # 根据话题应用不同风格（传递关系调制参数）
         if topic == "sword":
-            text = self._apply_sword_enthusiasm(text)
+            text = self._apply_sword_enthusiasm(text, style_mod)
         elif topic == "food":
-            text = self._apply_food_lover_tone(text)
+            text = self._apply_food_lover_tone(text, style_mod)
         elif topic == "modern":
             text = self._apply_modern_analogy(text)
         elif topic == "family":
             text = self._apply_avoidance(text)
         else:
-            text = self._apply_default_style(text)
+            text = self._apply_default_style(text, style_mod)
 
-        # 添加情感语气词（只有第一段加，避免碎嘴）
-        text = self._add_emotion_particles(text, emotion_state, topic, is_first_segment)
+        # 添加情感语气词（传递关系调制参数）
+        text = self._add_emotion_particles(text, emotion_state, topic, is_first_segment, relationship_mode, style_mod)
 
-        # 通用风格调整（传递 is_first_segment 避免多段重复修改）
-        text = self._apply_general_rules(text, is_first_segment=is_first_segment, topic=topic)
+        # 通用风格调整（传递关系调制参数）
+        text = self._apply_general_rules(text, is_first_segment=is_first_segment, topic=topic, style_mod=style_mod)
 
         return text
 
@@ -362,25 +330,46 @@ class LanguageStyleProcessor:
 
         return text
 
-    def _apply_sword_enthusiasm(self, text: str) -> str:
+    def _apply_sword_enthusiasm(self, text: str, style_mod: dict = None) -> str:
         """应用剑话题的兴奋风格（通过语气和内容体现，不添加动作描述）"""
         # 如果文本中没有剑相关词汇，自然引入
         if not any(kw in text for kw in ["剑", "刀", "武器"]):
             text = "说到这个…" + text
 
-        # 增加感叹号体现兴奋
-        if "！" not in text and "!" not in text:
-            text = text + "！"
+        # 根据关系等级调整兴奋程度
+        if style_mod:
+            rate = style_mod.get("sword_analogy_rate", 0.3)
+            if rate > 0.35:
+                # 老朋友：更兴奋、更详细
+                if "！" not in text and "!" not in text:
+                    text = text + "！"
+                if random.random() < rate - 0.3:
+                    text = "啊，这个我可太想聊了！" + text
+            elif rate < 0.15:
+                # 陌生人/backoff：克制兴奋
+                pass
+            else:
+                if "！" not in text and "!" not in text:
+                    text = text + "！"
+        else:
+            if "！" not in text and "!" not in text:
+                text = text + "！"
 
         return text
 
-    def _apply_food_lover_tone(self, text: str) -> str:
-        """应用食物话题的开心风格"""
-        food_exclamations = self.config.get("food_exclamations", [
-            "听起来好好吃！",
-            "我也想吃！",
-            "琼实鸟串才是最好的！",
-        ])
+    def _apply_food_lover_tone(self, text: str, style_mod: dict = None) -> str:
+        """应用食物话题的开心风格（关系等级驱动）"""
+        # 根据关系等级调整食物兴奋度
+        food_excitement = 0.7
+        if style_mod:
+            food_excitement = style_mod.get("food_excitement", 0.7)
+
+        if food_excitement > 0.5:
+            food_exclamations = self.config.get("food_exclamations", [
+                "听起来好好吃！",
+                "我也想吃！",
+                "琼实鸟串才是最好的！",
+            ])
         food_exclamation_prob = self.config.get("food_exclamation_probability", 0.3)
 
         if random.random() < food_exclamation_prob and food_exclamations:
@@ -409,29 +398,40 @@ class LanguageStyleProcessor:
 
         return text
 
-    def _apply_default_style(self, text: str) -> str:
-        """应用默认风格（更自然的句子结构）"""
-        # 控制句子长度
+    def _apply_default_style(self, text: str, style_mod: dict = None) -> str:
+        """应用默认风格（更自然的句子结构，关系等级驱动）"""
+        # 根据关系等级调整句子数量上限
         max_default_sentences = self.config.get("max_default_sentences", 3)
+        if style_mod:
+            verbose_bonus = style_mod.get("verbose_bonus", 0.0)
+            # verbose_bonus 为正（老朋友）→ 多说话；为负（陌生人）→ 少说话
+            max_default_sentences = max(1, min(5, max_default_sentences + int(verbose_bonus * 10)))
+
         sentences = re.split(r"[。！？\.\!\?]", text)
         sentences = [s.strip() for s in sentences if s.strip()]
 
         if len(sentences) > max_default_sentences:
-            # 如果句子太多，精简一下
             text = "。".join(sentences[:max_default_sentences]) + "。"
 
         # 拟人化：偶尔在长句中添加停顿（模拟思考）
-        if len(text) > 30 and random.random() < 0.15:
+        # 根据关系等级调整停顿概率
+        pause_prob = 0.15
+        if style_mod:
+            tease_rate = style_mod.get("teasing_rate", 0.2)
+            # 越熟悉越想得多→停顿概率越高（模拟更自然的对话节奏）
+            pause_prob = 0.1 + tease_rate * 0.2
+
+        if len(text) > 30 and random.random() < pause_prob:
             # 在逗号后添加省略号停顿
             comma_positions = [m.start() for m in re.finditer(r"，", text)]
             if comma_positions and len(comma_positions) >= 2:
-                # 在第二个逗号后添加停顿
                 pos = comma_positions[1]
-                text = text[:pos+1] + "…" + text[pos+1:]
+                text = text[:pos + 1] + "…" + text[pos + 1:]
 
         return text
 
-    def _add_emotion_particles(self, text: str, emotion_state: str, topic: str = "", is_first_segment: bool = True) -> str:
+    def _add_emotion_particles(self, text: str, emotion_state: str, topic: str = "", is_first_segment: bool = True,
+                               relationship_mode: str = "normal", style_mod: dict = None) -> str:
         """添加情感语气词（更自然的真人说话模式）
 
         真人语气词特点：
@@ -439,12 +439,14 @@ class LanguageStyleProcessor:
         - 位置不固定：可能在开头、结尾，或单独成句
         - 会根据句子长度和内容选择是否添加
         - 短句更倾向于加后缀，长句更倾向于加前缀或停顿
+        - 根据关系模式调整添加概率
 
         Args:
             text: 要处理的文本
             emotion_state: 情感状态
             topic: 当前话题，用于控制"哈！"等兴奋前缀的使用频率
             is_first_segment: 是否为多段回复中的第一段（只有第一段加语气词）
+            relationship_mode: 关系模式（normal/backoff/careful/warming），影响语气词概率
         """
         # 非第一段不添加语气词，避免碎嘴
         if not is_first_segment:
@@ -459,6 +461,21 @@ class LanguageStyleProcessor:
 
         # 基础概率（默认0.06，降低以避免过度使用）
         base_probability = self.config.get("emotion_particle_probability", 0.06)
+
+        # 根据关系模式调整基础概率
+        # backoff: 0.3x → 几乎不加; careful: 0.5x → 减少; normal: 1.0x; warming: 1.2x
+        rel_multiplier = RELATIONSHIP_MODES.get(
+            relationship_mode, {}
+        ).get("particle_multiplier", 1.0)
+        base_probability *= rel_multiplier
+
+        # Phase 1 P0 改进：关系等级驱动的风格调制
+        # 根据 style_mod 进一步微调语气词概率
+        if style_mod:
+            tsundere = style_mod.get("tsundere_intensity", 0.5)
+            # 傲娇程度越高，越可能会用"哼！"、"切～"等语气词
+            base_probability *= (0.8 + tsundere * 0.4)  # 0.8~1.2 范围
+            # kaomoji_bonus 影响颜文字概率（在 qq_behavior.py 中联动）
 
         # 根据句子特征动态调整概率
         text_len = len(text)
@@ -546,8 +563,11 @@ class LanguageStyleProcessor:
             return text + "~" + particle
         return text + particle
 
-    def _apply_general_rules(self, text: str, apply_length_limit: bool = True,
-                              is_first_segment: bool = True, topic: str = "general") -> str:
+    def _apply_general_rules(
+        self, text: str, apply_length_limit: bool = True,
+        is_first_segment: bool = True, topic: str = "general",
+        style_mod: dict = None, max_chars: int = None,
+    ) -> str:
         """应用通用语言规则：保持纯文字，过滤所有表情和动作
 
         拟人化增强：
@@ -559,27 +579,32 @@ class LanguageStyleProcessor:
         Args:
             text: 要处理的文本
             apply_length_limit: 是否应用长度限制（知识查询模式应设为False）
+            is_first_segment: 是否为第一段
+            topic: 话题类型
+            max_chars: 动态覆盖默认 max_text_length 的上限
 
         注意：知识查询模式下只清理格式，不做拟人化处理
         """
         # 1. 去除过于正式的表达（更口语化）
-        formal_words = {
-            "您好": "你好",
-            "请问": "",
-            "非常抱歉": "对不起啦",
-            "非常感谢": "谢了",
-            "请问您": "你",
-            "您": "你",  # QQ聊天很少用"您"
-            "是否": "是不是",
-            "能否": "能不能",
-            "如何": "怎么",
-            "为何": "为什么",
-            "之": "的",  # 过于文言
-            "亦": "也",
-            "乃": "是",
-        }
-        for formal, casual in formal_words.items():
-            text = text.replace(formal, casual)
+        # 使用正则词边界匹配，避免单字全局替换破坏合法用法
+        import re as _re
+        formal_replacements = [
+            ("您好", "你好"),
+            ("请问", ""),
+            ("非常抱歉", "对不起啦"),
+            ("非常感谢", "谢了"),
+            ("请问您", "你"),
+            (r"您(?![们])", "你"),  # "您" 但不替换 "你们"（虽然"你们"不含"您"，防御性写法）
+            ("是否", "是不是"),
+            ("能否", "能不能"),
+            ("如何", "怎么"),
+            ("为何", "为什么"),
+            (r"(?<![之乃亦])之(?![前后上下内外间中里])", "的"),  # "之" 但不替换 "之前""之间""之所以" 等
+            (r"(?<![不])亦", "也"),  # "亦" 但不替换 "不亦"
+            (r"(?<![是])乃(?![至])", "是"),  # "乃" 但不替换 "乃至"
+        ]
+        for pattern, casual in formal_replacements:
+            text = _re.sub(pattern, casual, text)
 
         # 2. 统一过滤（委托 filters.clean_text，mode='format' 只做格式清理）
         text = filters.clean_text(text, mode="format")
@@ -619,20 +644,16 @@ class LanguageStyleProcessor:
             if random.random() < 0.06:
                 text = text.replace("很", "挺", 1)
 
-        # 6. 确保句子不要太长（按话题动态调整，减少分段数）
+        # 6. 确保句子不要太长（聊天模式下应用长度限制）
         # 注意：知识查询模式下的长度限制由 main.py 统一控制（默认1200）
-        # 这里只在聊天模式下应用较短的长度限制，按话题精准控制
         if apply_length_limit:
-            # 按话题选择长度上限，话题不存在时退回到 120
-            topic_max = self.TOPIC_MAX_LENGTH.get(topic, 120)
-            # 全局配置作为硬上限
-            config_max = self.config.get("max_text_length", 200)
-            max_text_length = min(topic_max, config_max)
+            # v2.2.0 统一使用 max_text_length；max_chars 可动态覆盖默认值
+            max_text_length = max_chars if max_chars is not None else self.config.get("max_text_length", 200)
             if len(text) > max_text_length:
                 # 智能句子补全截断：在限制范围内回退到最近的句号
                 cut = max_text_length
                 for i in range(max_text_length, max(1, max_text_length - 30), -1):
-                    if text[i-1] in '。！？.!?\n':
+                    if text[i - 1] in '。！？.!?\n':
                         cut = i
                         break
                 text = text[:cut]
@@ -655,8 +676,8 @@ class LanguageStyleProcessor:
         """判断是否可以直接使用数据库台词响应"""
         topic = self.detect_topic(text)
 
-        # 某些简单场景可以直接用数据库台词
-        direct_topics = ["greeting", "farewell", "sword_simple"]
+        # 某些简单场景可以直接用数据库台词响应
+        direct_topics = ["greeting", "farewell", "sword"]
 
         return topic in direct_topics
 

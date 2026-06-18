@@ -9,11 +9,19 @@ from typing import List, Optional
 
 
 def estimate_tokens(text: str) -> int:
-    """估算文本 Token 数（1 Token ≈ 2 个中文字符）
+    """估算文本 Token 数
+
+    区分中英文字符分别计算：
+    - 中文字符：约 1.5 Token/字符
+    - 英文/数字/标点：约 0.25 Token/字符（4字符 ≈ 1 Token）
 
     用于 Token 预算控制，替代各处重复的 len(text) // 2。
     """
-    return len(text) // 2
+    if not text:
+        return 0
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+    other_chars = len(text) - chinese_chars
+    return int(chinese_chars * 1.5 + other_chars * 0.25)
 
 
 def truncate_at_sentence(text: str, max_len: int, min_lookback: int = 15) -> str:
@@ -136,3 +144,76 @@ def is_structured_summary(text: str) -> bool:
     has_bold = bool(re.search(r'\*\*[^*]+\*\*', text))
     has_separator = bool(re.search(r'(^|\n)\s*---+\s*(\n|$)', text))
     return has_heading or has_numbered_list or (has_bold and has_numbered_list) or has_separator
+
+
+class AtDetector:
+    """At 检测器
+
+    判断消息是否提到了机器人。
+    提供缓存 self_id 的能力，避免每次检测都重复查找。
+
+    从 core/at_detector.py 合并而来（S3 简化项），与 utils.py 定位一致：
+    纯检测逻辑 + 单个缓存字段，无内部状态依赖。
+    """
+
+    def __init__(self):
+        self._cached_self_id: Optional[str] = None
+
+    def set_self_id(self, self_id: str):
+        """设置缓存的机器人 ID"""
+        self._cached_self_id = self_id
+
+    def get_self_id(self) -> Optional[str]:
+        return self._cached_self_id
+
+    def is_at_me(self, event, override_self_id: str = None) -> bool:
+        """检测消息是否提到了机器人
+
+        分层检测：
+        1. 快速早退：消息文本不含 @ 相关标记
+        2. 框架方法 is_at_me()
+        3. 遍历消息组件中的 At
+        4. 文本匹配 [At:id]
+
+        Args:
+            event: AstrMessageEvent
+            override_self_id: 可选，临时覆盖缓存的 self_id
+
+        Returns:
+            True → 消息提到了机器人
+        """
+        message = event.message_str or ""
+
+        # 快速早退：不含 @ 相关标记
+        if "@" not in message and "[At:" not in message and "At:" not in message:
+            return False
+
+        self_id = override_self_id or self._cached_self_id
+
+        # 方法1：框架方法
+        is_at_me_fn = getattr(event, 'is_at_me', None)
+        if callable(is_at_me_fn) and is_at_me_fn():
+            return True
+
+        # 方法2：遍历消息组件
+        try:
+            chain = getattr(event, "message_obj", None)
+            if chain and hasattr(chain, "message"):
+                for comp in chain.message:
+                    class_name = comp.__class__.__name__.lower()
+                    if class_name == "at":
+                        qq = str(getattr(comp, "qq", "") or "").strip()
+                        if qq.lower() == "all":
+                            return True
+                        if self_id and qq == self_id:
+                            return True
+                        # self_id 未初始化时保守处理：不判定为 @ 我
+                        # 避免将所有含 @ 的消息都误判为 @ 机器人
+        except Exception:
+            pass
+
+        # 方法3：文本匹配
+        if self_id and f"[At:{self_id}]" in message:
+            return True
+
+        return False

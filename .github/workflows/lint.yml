@@ -1,0 +1,64 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake8:
+    name: flake8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install flake8
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Run flake8 on production source
+        run: |
+          flake8 . \
+            --count \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503,E203,E731,W504 \
+            --exclude=.git,.github,__pycache__,build,dist,*.egg-info,evolution/discoveries,evolution/logs,evolution/pending_rules,evolution/eval/data,data,database,tests,evolution/tests \
+            --show-source \
+            --statistics
+
+  pytest:
+    name: pytest (lint job)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+
+      - name: Run full test suite
+        run: |
+          python -m pytest tests/ evolution/tests/ -v --tb=short
+
+      - name: Print summary line
+        if: always()
+        run: |
+          python -m pytest tests/ evolution/tests/ -q 2>&1 | tail -5

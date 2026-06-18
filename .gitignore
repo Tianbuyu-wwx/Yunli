@@ -4,11 +4,61 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .coverage
+.coverage.*
+htmlcov/
+coverage.xml
 *.egg-info/
+.mypy_cache/
+.ruff_cache/
 
 # 运行时数据库文件（用户数据，不应提交）
+# 根目录兜底
+*.db
+*.db-shm
+*.db-wal
+
+# data/ 目录下的运行时数据库（更具体的覆盖，保留向后兼容）
 data/*.db
 data/*.db-shm
 data/*.db-wal
 
-tests/
+# AstrBot 插件运行时产物
+data/*.json.gz
+data/*.tmp
+
+# Darwin 进化产物（重跑可重建，避免污染仓库）
+evolution/baseline.json
+evolution/results.tsv
+evolution/test_prompts.json
+evolution/logs/
+evolution/discoveries/
+evolution/pending_rules/
+evolution/eval/data/
+evolution/__pycache__/
+evolution/**/__pycache__/
+# 进化日志快照（运行时持续追加，可达数百 KB，不应纳入版本库）
+evolution/evolution_log.md
+# 资产应用产物（运行时生成）
+evolution/applied_backups/
+evolution/applied_runtime.json
+# 资产备份文件（save_asset 自动生成，保留最近 10 个）
+evolution/assets/*.bak.*.md
+
+# 端到端验证脚本（本地手动跑，不进 CI）
+_e2e_verify.py
+_e2e_*.py
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 构建 / 分发
+build/
+dist/
+*.whl
+
+# 测试隔离目录（已改为纳入版本库，保留冒烟测试）
+# tests/

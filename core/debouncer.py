@@ -4,9 +4,12 @@
 """
 import asyncio
 import time
+import logging
 from typing import Any, Callable, Dict, Optional
 
 from .utils import merge_messages
+
+logger = logging.getLogger(__name__)
 
 
 class MessageDebouncer:
@@ -26,14 +29,21 @@ class MessageDebouncer:
         debounce_seconds: float = 3.0,
         max_wait_seconds: float = 8.0,
         on_flush: Optional[Callable] = None,
+        on_individual_message: Optional[Callable] = None,
     ):
         self._debounce_seconds = debounce_seconds
         self._max_wait_seconds = max_wait_seconds
         self._on_flush = on_flush
+        # 合并消息时，对每条原始消息单独调用此回调（用于记忆提取）
+        # 避免"我喜欢猫"+"我喜欢狗"合并后只提取出一条偏好
+        # 签名: async def on_individual_message(event, req)
+        self._on_individual_message = on_individual_message
         # 缓冲区: scope -> {events, reqs, task, first_ts}
         self._buffer: Dict[str, Dict] = {}
         # 上次立即处理时间: scope -> timestamp
         self._last_process_time: Dict[str, float] = {}
+        # P2-5 修复：缓冲区 TTL，超过 5 分钟的缓冲区强制清理
+        self._buffer_ttl_seconds = 300
         self._lock = asyncio.Lock()
 
     async def handle_message(self, scope: str, event: Any, req: Any) -> bool:
@@ -53,6 +63,20 @@ class MessageDebouncer:
 
         async with self._lock:
             now = time.time()
+
+            # P2-5 修复：清理超过 TTL 的过期缓冲区，避免内存泄漏
+            expired_scopes = [
+                s for s, buf in self._buffer.items()
+                if now - buf.get("first_ts", now) > self._buffer_ttl_seconds
+            ]
+            for s in expired_scopes:
+                old_task = self._buffer[s].get("task")
+                if old_task and not old_task.done():
+                    old_task.cancel()
+                del self._buffer[s]
+                self._last_process_time.pop(s, None)
+                logger.debug("清理过期防抖缓冲区: %s", s)
+
             last_ts = self._last_process_time.get(scope, 0)
 
             # 窗口已过期（距上次处理超过 debounce_seconds）→ 立即处理
@@ -96,6 +120,15 @@ class MessageDebouncer:
             if not events or not reqs or not self._on_flush:
                 return
 
+            # 合并前：对每条原始消息单独触发记忆提取
+            # 避免"我喜欢猫"+"我喜欢狗"合并后只提取出一条偏好
+            if self._on_individual_message and len(events) > 1:
+                for evt, req in zip(events, reqs):
+                    try:
+                        await self._on_individual_message(evt, req)
+                    except Exception as e:
+                        logger.debug("单条消息记忆提取失败: %s", e)
+
             # 合并消息内容
             primary_event = events[0]
             primary_req = reqs[0]
@@ -122,7 +155,7 @@ class MessageDebouncer:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[云璃防抖] 处理失败: {e}")
+            logger.error("防抖处理失败: %s", e)
             try:
                 async with self._lock:
                     buffer = self._buffer.pop(scope, None)
@@ -132,7 +165,7 @@ class MessageDebouncer:
                         )
                         self._last_process_time[scope] = time.time()
             except Exception as e2:
-                print(f"[云璃防抖] 兜底处理失败: {e2}")
+                logger.error("防抖兜底处理失败: %s", e2)
 
     def is_buffered(self, req: Any) -> bool:
         """检查请求是否已被防抖缓冲（调用方检查后应跳过处理）"""

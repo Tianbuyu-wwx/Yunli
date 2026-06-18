@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS user_memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_user ON user_memories(group_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON user_memories(memory_type);
+-- P2-2 修复：添加复合索引，优化高频查询
+-- get_important_memories / get_group_memories 按 group_id + status + confidence 过滤
+CREATE INDEX IF NOT EXISTS idx_memories_lookup ON user_memories(group_id, status, confidence);
+-- get_recent_interactions / get_active_groups 按 group_id + created_at 过滤
+CREATE INDEX IF NOT EXISTS idx_logs_group_time ON interaction_logs(group_id, created_at);
+-- replace_user_memories 查询 expires_at
+CREATE INDEX IF NOT EXISTS idx_memories_expires ON user_memories(group_id, user_id, expires_at);
 
 -- 群聊摘要表（周期性总结）
 CREATE TABLE IF NOT EXISTS chat_summaries (

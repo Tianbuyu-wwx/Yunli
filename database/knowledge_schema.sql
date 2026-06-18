@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS modern_analogies (
     modern_term TEXT NOT NULL,
     yunli_analogy TEXT NOT NULL,
     category TEXT,
+    -- deprecated: usage_count 字段无更新机制，永远为 0，保留仅为向后兼容
     usage_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

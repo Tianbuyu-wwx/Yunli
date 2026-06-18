@@ -25,15 +25,15 @@ class MessageSplitter:
 
     def __init__(self, config: dict = None):
         self.config = config or {}
-        self.max_segment_length = self.config.get('max_segment_length', 180)
+        self.max_segment_length = self.config.get('max_segment_length', 80)
         self.min_segment_length = self.config.get('min_segment_length', 10)
         self.enable_typing_delay = self.config.get('enable_typing_delay', True)
-        self.base_delay = self.config.get('base_delay', 0.5)
-        self.delay_per_char = self.config.get('delay_per_char', 0.03)
-        self.max_delay = self.config.get('max_delay', 3.0)
+        self.base_delay = self.config.get('base_delay', 1.5)
+        self.delay_per_char = self.config.get('delay_per_char', 0.04)
+        self.max_delay = self.config.get('max_delay', 4.0)
         self.enable_thinking_pause = self.config.get('enable_thinking_pause', True)
         self.thinking_pause_prob = self.config.get('thinking_pause_prob', 0.3)
-        self.max_segments = self.config.get('max_segments', 5)
+        self.max_segments = self.config.get('max_segments', 2)
 
     def split(self, text: str) -> List[Dict[str, any]]:
         """切分消息为多个片段
@@ -180,7 +180,12 @@ class MessageSplitter:
         return f"{softened}{right}"
 
     def _calculate_delay(self, text: str, index: int, total: int) -> float:
-        """计算发送延迟"""
+        """计算发送延迟（模拟真人打字节奏）
+
+        短消息策略下的延迟特点：
+        - 首段快速发出（模拟看到消息就回）
+        - 后续段有明显的"打字思考"间隔
+        """
         if not self.enable_typing_delay:
             return 0.0
         typing_time = len(text) * self.delay_per_char
@@ -188,11 +193,9 @@ class MessageSplitter:
         delay = min(delay, self.max_delay)
         delay *= random.uniform(0.8, 1.2)
         if index == 0:
-            delay *= 0.3
-        elif index < total - 1:
-            delay *= 0.7
+            delay *= 0.2  # 首段几乎无延迟，快速回应
         else:
-            delay *= 1.1
+            delay *= 1.0  # 后续段保留完整延迟，模拟打字思考
         if len(text) <= 10:
             delay *= 0.5
         return delay

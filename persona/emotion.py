@@ -1,9 +1,17 @@
 import random
-import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+# Darwin 进化后的情感触发器占位（运行时通过 overlay 动态生效）
+EMOTION_TRIGGERS = """
+"""
 
 from . import filters
-from .language import SWORD_KEYWORDS, FOOD_KEYWORDS, PLAY_KEYWORDS, INTIMACY_KEYWORDS, HELP_KEYWORDS
+from .config import (
+    SWORD_KEYWORDS,
+    FOOD_KEYWORDS,
+    PLAY_KEYWORDS,
+    RELATIONSHIP_MODES,
+)
 
 
 class EmotionStateMachine:
@@ -34,6 +42,9 @@ class EmotionStateMachine:
         "joke_made": "happy",
     }
 
+    # state_history 最大保留条数，防止内存泄漏
+    MAX_STATE_HISTORY = 100
+
     def __init__(self, config: dict = None):
         self.config = config or {}
         self.current_state = "neutral"
@@ -42,37 +53,142 @@ class EmotionStateMachine:
         self.state_duration = 0  # 当前状态持续时间
         self.max_duration = self.config.get("emotion_max_duration", 3)  # 最大持续轮数
 
+        # ========== 复合情感支持（Phase 1 P1 改进） ==========
+        # 复合情感：除主情感外，可同时存在副情感（如"开心+傲娇"）
+        self.compound_emotions: Dict[str, float] = {}  # 副情感标签 -> 强度
+        self.compound_max = self.config.get("emotion_compound_max", 3)  # 最多保留几个副情感
+        # 情感平滑过渡：新状态 = 旧状态 * blend_weight + 新状态 * (1 - blend_weight)
+        self.blend_weight = self.config.get("emotion_blend_weight", 0.3)  # 旧状态保留权重（0~1，越大越平滑）
+
+        # 实例级 transitions，支持运行时 overlay 覆盖目标情感
+        self.transitions = dict(self.TRANSITIONS)
+        self._load_emotion_overlay()
+
+    def _load_emotion_overlay(self):
+        """从运行时 overlay 加载进化后的情感触发器映射
+
+        overlay 格式（纯文本）：
+            # 注释
+            trigger_name -> target_emotion
+        """
+        try:
+            from ..evolution import asset_bridge
+            overlay_text = asset_bridge.get_runtime_overlay("emotion_templates")
+            if not overlay_text:
+                return
+        except (ImportError, OSError):
+            return
+
+        for line in overlay_text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "->" not in line:
+                continue
+            parts = line.split("->", 1)
+            if len(parts) != 2:
+                continue
+            trigger = parts[0].strip()
+            target = parts[1].strip()
+            if trigger and target:
+                self.transitions[trigger] = target
+
+    def _record_history(self, state: str, duration: int):
+        """记录状态历史（带容量限制）"""
+        self.state_history.append({"state": state, "duration": duration})
+        # 超限时裁剪，只保留最近的记录
+        if len(self.state_history) > self.MAX_STATE_HISTORY:
+            self.state_history = self.state_history[-self.MAX_STATE_HISTORY:]
+
     def transition(self, trigger: str, context: str = ""):
-        """根据触发器转换情感状态"""
-        new_state = self.TRANSITIONS.get(trigger, "neutral")
+        """根据触发器转换情感状态
+
+        支持复合情感：
+        - 若新状态与当前状态不同，新状态成为主情感，旧主情感降级为副情感
+        - 副情感在 auto_decay 中衰减更快
+        - 平滑过渡：新状态保留部分旧状态的特征
+        """
+        new_state = self.transitions.get(trigger, "neutral")
 
         if new_state != self.current_state:
-            self.state_history.append(
-                {"state": self.current_state, "duration": self.state_duration}
-            )
+            # 将旧主情感降级为副情感（带衰减权重）
+            if self.current_state != "neutral":
+                old_intensity = self.intensity * self.blend_weight
+                if old_intensity > 0.1:
+                    # 清理旧副情感，降级旧主情感为副情感
+                    self.compound_emotions[self.current_state] = old_intensity
+                    # 保持最多 compound_max 个副情感
+                    if len(self.compound_emotions) > self.compound_max:
+                        sorted_emotions = sorted(
+                            self.compound_emotions.items(), key=lambda x: x[1], reverse=True
+                        )
+                        self.compound_emotions = dict(sorted_emotions[:self.compound_max])
+
+            self._record_history(self.current_state, self.state_duration)
             self.current_state = new_state
             self.state_duration = 0
-            self.intensity = self.EMOTION_STATES[new_state]["intensity"]
+            # 平滑过渡：新状态强度 = 基础强度 + 旧状态残余
+            base_intensity = self.EMOTION_STATES[new_state]["intensity"]
+            residual = self.intensity * self.blend_weight * 0.3
+            self.intensity = min(1.0, base_intensity + residual)
         else:
+            # 情感惯性：连续处于同一情感状态时增强强度
+            self.intensity = min(1.0, self.intensity + 0.1)
             self.state_duration += 1
 
+    def get_compound_state_description(self) -> str:
+        """获取复合情感状态描述
+
+        返回格式: "主情感(副情感1,副情感2) 强度X.XX"
+        如: "excited(tsundere) 强度0.75"
+        """
+        state_info = self.EMOTION_STATES.get(
+            self.current_state, self.EMOTION_STATES["neutral"]
+        )
+        main_desc = f"{self.current_state}({state_info['description']}"
+
+        # 追加活跃的副情感（强度 > 0.1）
+        active_compounds = [
+            f"{k}:{v:.2f}"
+            for k, v in self.compound_emotions.items()
+            if v > 0.1
+        ]
+        if active_compounds:
+            main_desc += f", +{'+'.join(active_compounds)}"
+
+        main_desc += f", 强度{self.intensity:.2f})"
+        return main_desc
+
     def auto_decay(self):
-        """情感自然衰减"""
+        """情感自然衰减（指数衰减，更自然）
+
+        复合情感版：主情感和副情感同时衰减，副情感衰减更快。
+        """
         self.state_duration += 1
-        if self.state_duration >= self.max_duration and self.current_state != "neutral":
-            self.state_history.append(
-                {"state": self.current_state, "duration": self.state_duration}
-            )
-            self.current_state = "neutral"
-            self.state_duration = 0
-            self.intensity = self.EMOTION_STATES["neutral"]["intensity"]
+
+        # 主情感衰减
+        if self.current_state != "neutral":
+            self.intensity *= 0.75
+            if self.intensity < 0.15:
+                self._record_history(self.current_state, self.state_duration)
+                self.current_state = "neutral"
+                self.state_duration = 0
+                self.intensity = self.EMOTION_STATES["neutral"]["intensity"]
+
+        # 副情感衰减（更快，因子 0.5）
+        decayed_compounds = {}
+        for emotion, intensity in self.compound_emotions.items():
+            new_intensity = intensity * 0.5
+            if new_intensity > 0.05:  # 太弱就丢弃
+                decayed_compounds[emotion] = new_intensity
+        self.compound_emotions = decayed_compounds
 
     def get_current_state_description(self) -> str:
         """获取当前状态描述"""
         state_info = self.EMOTION_STATES.get(
             self.current_state, self.EMOTION_STATES["neutral"]
         )
-        return f"{self.current_state}({state_info['description']}, 强度{state_info['intensity']})"
+        return f"{self.current_state}({state_info['description']}, 强度{self.intensity:.2f})"
 
     def get_emotion_for_response(self, db) -> Dict:
         """获取用于响应的情感数据"""
@@ -90,25 +206,56 @@ class EmotionStateMachine:
             "standalone": random.choice(standalones)["content"] if standalones else "",
         }
 
-    def detect_trigger(self, text: str) -> Optional[str]:
-        """从文本中检测情感触发器"""
-        triggers = {
-            "sword_mentioned": SWORD_KEYWORDS,
-            "food_mentioned": FOOD_KEYWORDS,
-            "praised": ["厉害", "强", "棒", "帅", "可爱", "喜欢", "爱你"],
-            "thanked": ["谢谢", "感谢", "多亏", "帮大忙"],
-            "insulted": ["笨", "蠢", "弱", "菜", "废物", "垃圾"],
-            "sad_topic": ["死", "离别", "失去", "痛苦", "悲伤", "哭"],
-            "mission_mentioned": ["魔剑", "任务", "使命", "猎剑", "责任"],
-            "new_thing": ["新", "第一次", "没见过", "是什么", "介绍一下"],
-            "boring_chat": ["无聊", "没事", "随便", "发呆"],
-            "joke_made": PLAY_KEYWORDS,
-        }
+    # 情感触发器关键词映射（类常量，避免 detect_trigger/detect_triggers 重复定义）
+    _EMOTION_TRIGGERS = {
+        "sword_mentioned": SWORD_KEYWORDS,
+        "food_mentioned": FOOD_KEYWORDS,
+        "praised": [
+            "厉害", "强", "棒", "帅", "可爱", "喜欢", "爱你",
+            "牛", "大神", "太强了", "好厉害", "佩服", "崇拜",
+            "天才", "无敌", "最强", "第一", "优秀", "出色",
+        ],
+        "thanked": [
+            "谢谢", "感谢", "多亏", "帮大忙",
+            "多谢", "感恩", "辛苦了", "还好有你", "靠你了",
+        ],
+        "insulted": [
+            "笨", "蠢", "弱", "菜", "废物", "垃圾",
+            "没用", "废柴", "弱鸡", "不行", "差劲", "太弱",
+        ],
+        "sad_topic": [
+            "死", "离别", "失去", "痛苦", "悲伤", "哭",
+            "难过", "伤心", "流泪", "心碎", "绝望", "崩溃",
+            "失恋", "分手", "孤独", "寂寞", "想哭",
+        ],
+        "mission_mentioned": [
+            "魔剑", "任务", "使命", "猎剑", "责任",
+            "战斗", "敌人", "讨伐", "守护", "保护", "歼灭",
+        ],
+        "new_thing": [
+            "新", "第一次", "没见过", "是什么", "介绍一下",
+            "好奇", "没听过", "告诉我", "这是啥", "什么东东",
+        ],
+        "boring_chat": [
+            "无聊", "没事", "随便", "发呆",
+            "没劲", "无趣", "好闲", "没事干", "不知道干嘛",
+        ],
+        "joke_made": PLAY_KEYWORDS,
+    }
 
-        for trigger, keywords in triggers.items():
+    def detect_trigger(self, text: str) -> Optional[str]:
+        """从文本中检测情感触发器（返回首个匹配，扩展版：同义词覆盖）"""
+        for trigger, keywords in self._EMOTION_TRIGGERS.items():
             if any(kw in text for kw in keywords):
                 return trigger
         return None
+
+    def detect_triggers(self, text: str) -> List[str]:
+        """从文本中检测所有情感触发器（复合情感检测，扩展版）"""
+        return [
+            trigger for trigger, keywords in self._EMOTION_TRIGGERS.items()
+            if any(kw in text for kw in keywords)
+        ]
 
     def inject_emotion(self, text: str, db) -> str:
         """根据当前情感状态润色文本
@@ -168,214 +315,3 @@ class EmotionStateMachine:
             text = text.replace("！", "！！", 1)
 
         return text
-
-
-class RelationshipManager:
-    """关系状态机 - 感知用户边界和互动温度，动态调节回复策略
-
-    关系模式：
-    - normal: 正常互动
-    - backoff: 用户表达了边界（别烦/闭嘴/吵），需要收敛
-    - careful: 用户情绪低落（烦/累/难受），需要温和
-    - warming: 互动升温（哈哈/贴贴/喜欢），可以更自然亲近
-
-    每个用户独立维护关系状态，按 group_id + user_id 存储。
-    状态会自动衰减回 normal。
-    """
-
-    RELATIONSHIP_MODES = {
-        "normal": {
-            "reply_length_limit": None,       # 不限制
-            "hint": "",                        # 无特殊提示
-            "decay_seconds": 0,               # 不衰减
-        },
-        "backoff": {
-            "reply_length_limit": 40,          # 回复要短
-            "hint": "用户可能在表达边界，回复要短、低压，不要追问，不要主动找话题",
-            "decay_seconds": 6 * 3600,         # 6小时后自动恢复
-        },
-        "careful": {
-            "reply_length_limit": 80,          # 回复适中
-            "hint": "用户可能有压力或情绪低落，先接住情绪，少讲道理，语气温和",
-            "decay_seconds": 2 * 3600,         # 2小时后自动恢复
-        },
-        "warming": {
-            "reply_length_limit": None,        # 不限制
-            "hint": "互动有升温，可以更自然亲近一点，偶尔开开玩笑",
-            "decay_seconds": 30 * 60,          # 30分钟后自然回落
-        },
-    }
-
-    # 边界信号词（触发 backoff）
-    BOUNDARY_KEYWORDS = [
-        "别烦", "闭嘴", "吵死了", "太吵", "别说了", "够了",
-        "滚", "走开", "不要你管", "别管我", "烦死了",
-        "能不能安静", "你能不能别", "少说话",
-    ]
-
-    # 情绪低落信号词（触发 careful）
-    CAREFUL_KEYWORDS = [
-        "好烦", "好累", "难受", "心累", "emo", "抑郁",
-        "不想说话", "不想聊", "心情不好", "不开心",
-        "压力好大", "好难", "撑不住了", "崩溃",
-    ]
-
-    # 升温信号词（触发 warming）
-    WARMING_KEYWORDS = [
-        "哈哈", "贴贴", "喜欢", "想你了", "爱你",
-        "好可爱", "最棒", "嘿嘿", "么么", "抱抱",
-        "好开心", "太好了", "真好",
-    ]
-
-    def __init__(self, config: dict = None):
-        self.config = config or {}
-        # 用户关系状态存储: (group_id, user_id) -> {"mode": str, "entered_at": float}
-        self._user_states: Dict[tuple, Dict] = {}
-        # 自定义衰减时间倍数
-        self._decay_multiplier = self.config.get("relationship_decay_multiplier", 1.0)
-
-    def detect_intent(self, text: str) -> Optional[str]:
-        """从用户消息中检测关系意图信号
-
-        Returns:
-            "backoff" / "careful" / "warming" / None
-        """
-        # 优先检测边界信号（最高优先级，一旦触发立即收敛）
-        for kw in self.BOUNDARY_KEYWORDS:
-            if kw in text:
-                return "backoff"
-
-        # 检测情绪低落信号
-        for kw in self.CAREFUL_KEYWORDS:
-            if kw in text:
-                return "careful"
-
-        # 检测升温信号
-        for kw in self.WARMING_KEYWORDS:
-            if kw in text:
-                return "warming"
-
-        return None
-
-    def detect_user_intent(self, text: str) -> str:
-        """细粒度用户意图分析
-
-        在关系意图基础上增加更多意图类型，用于影响情感状态和回复模式。
-
-        Returns:
-            "boundary" / "comfort" / "play" / "intimacy" / "help" / "chat"
-        """
-        # 1. 边界意图（最高优先级）
-        for kw in self.BOUNDARY_KEYWORDS:
-            if kw in text:
-                return "boundary"
-
-        # 2. 情绪低落意图
-        for kw in self.CAREFUL_KEYWORDS:
-            if kw in text:
-                return "comfort"
-
-        # 3. 亲密/撒娇意图（引用共享常量）
-        for kw in INTIMACY_KEYWORDS:
-            if kw in text:
-                return "intimacy"
-
-        # 4. 玩乐意图（引用共享常量）
-        for kw in PLAY_KEYWORDS:
-            if kw in text:
-                return "play"
-
-        # 5. 求助意图（引用共享常量）
-        for kw in HELP_KEYWORDS:
-            if kw in text:
-                return "help"
-
-        # 6. 默认闲聊
-        return "chat"
-
-    # 意图到情感触发器的映射
-    INTENT_TO_EMOTION_TRIGGER = {
-        "boundary": "insulted",      # 边界 → 不耐烦
-        "comfort": "sad_topic",      # 情绪低落 → 悲伤掩饰
-        "play": "joke_made",         # 玩乐 → 开心
-        "intimacy": "praised",       # 亲密 → 傲娇
-        "help": "mission_mentioned", # 求助 → 认真
-        "chat": None,                # 闲聊 → 不触发
-    }
-
-    def update(self, group_id: str, user_id: str, text: str) -> str:
-        """根据用户消息更新关系状态
-
-        Returns:
-            当前关系模式名称
-        """
-        key = (group_id, user_id)
-        intent = self.detect_intent(text)
-
-        if intent and intent in self.RELATIONSHIP_MODES:
-            self._user_states[key] = {
-                "mode": intent,
-                "entered_at": time.time(),
-            }
-
-        return self.get_mode(group_id, user_id)
-
-    def get_mode(self, group_id: str, user_id: str) -> str:
-        """获取当前关系模式（含自动衰减检查）"""
-        key = (group_id, user_id)
-        state = self._user_states.get(key)
-
-        if not state:
-            return "normal"
-
-        mode = state["mode"]
-        mode_config = self.RELATIONSHIP_MODES[mode]
-        decay_seconds = mode_config["decay_seconds"] * self._decay_multiplier
-
-        # 检查是否已衰减
-        if decay_seconds > 0:
-            elapsed = time.time() - state["entered_at"]
-            if elapsed >= decay_seconds:
-                # 自动衰减回 normal
-                del self._user_states[key]
-                return "normal"
-
-        return mode
-
-    def get_hint(self, group_id: str, user_id: str) -> str:
-        """获取当前关系模式的提示词"""
-        mode = self.get_mode(group_id, user_id)
-        return self.RELATIONSHIP_MODES[mode]["hint"]
-
-    def get_reply_length_limit(self, group_id: str, user_id: str) -> Optional[int]:
-        """获取当前关系模式的回复长度限制
-
-        Returns:
-            字符数上限，None 表示不限制
-        """
-        mode = self.get_mode(group_id, user_id)
-        return self.RELATIONSHIP_MODES[mode]["reply_length_limit"]
-
-    def force_set_mode(self, group_id: str, user_id: str, mode: str):
-        """强制设置关系模式（用于测试或管理命令）"""
-        if mode in self.RELATIONSHIP_MODES:
-            key = (group_id, user_id)
-            if mode == "normal":
-                self._user_states.pop(key, None)
-            else:
-                self._user_states[key] = {
-                    "mode": mode,
-                    "entered_at": time.time(),
-                }
-
-    def cleanup_expired(self):
-        """清理所有已衰减的关系状态"""
-        now = time.time()
-        expired_keys = []
-        for key, state in self._user_states.items():
-            mode = state["mode"]
-            decay_seconds = self.RELATIONSHIP_MODES[mode]["decay_seconds"] * self._decay_multiplier
-            if decay_seconds > 0 and (now - state["entered_at"]) >= decay_seconds:
-                expired_keys.append(key)
-        for key in expired_keys:
-            del self._user_states[key]

@@ -2,9 +2,12 @@ import sqlite3
 import json
 import time
 import threading
+import logging
 from collections import OrderedDict
 from pathlib import Path
 from typing import List, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class YunliKnowledgeDB:
@@ -24,8 +27,11 @@ class YunliKnowledgeDB:
         self._init_tables()
 
         # query_knowledge LRU 缓存（线程安全，缓存最近 64 次查询结果）
+        # 注意：连接是线程本地的，但缓存是实例级共享的，必须加锁保护
+        # OrderedDict 的 pop/popitem/写入是复合操作，并发下会损坏
         self._knowledge_query_cache: OrderedDict = OrderedDict()
         self._knowledge_cache_max = 64
+        self._cache_lock = threading.Lock()
 
     def _get_conn(self):
         """获取当前线程的数据库连接（线程安全）"""
@@ -168,15 +174,22 @@ class YunliKnowledgeDB:
         return [dict(row) for row in cursor.fetchall()]
 
     def query_knowledge(self, keyword: str, limit: int = 3) -> List[Dict]:
-        """查询角色知识库（带LRU缓存）"""
-        # 构建缓存 key
-        cache_key = (keyword, limit)
-        if cache_key in self._knowledge_query_cache:
-            # 移到末尾标记为最近使用
-            result = self._knowledge_query_cache.pop(cache_key)
-            self._knowledge_query_cache[cache_key] = result
-            return result
+        """查询角色知识库（带LRU缓存，线程安全）
 
+        缓存读/写均受 _cache_lock 保护，避免多线程并发下
+        OrderedDict 的 pop+重新插入复合操作导致数据损坏。
+        数据库查询在锁外执行，不影响并发性能。
+        """
+        cache_key = (keyword, limit)
+
+        # 缓存读：加锁保护 OrderedDict 的 pop + 重新插入（LRU 命中提升）
+        with self._cache_lock:
+            if cache_key in self._knowledge_query_cache:
+                result = self._knowledge_query_cache.pop(cache_key)
+                self._knowledge_query_cache[cache_key] = result
+                return result
+
+        # 缓存未命中：查询数据库（使用线程本地连接，无需加锁）
         conn = self._get_conn()
         cursor = conn.execute(
             "SELECT * FROM character_knowledge WHERE entity_name LIKE ? OR description LIKE ? ORDER BY importance DESC LIMIT ?",
@@ -184,10 +197,11 @@ class YunliKnowledgeDB:
         )
         result = [dict(row) for row in cursor.fetchall()]
 
-        # 写入缓存（超限时淘汰最久未访问条目）
-        while len(self._knowledge_query_cache) >= self._knowledge_cache_max:
-            self._knowledge_query_cache.popitem(last=False)
-        self._knowledge_query_cache[cache_key] = result
+        # 缓存写：加锁保护淘汰 + 写入
+        with self._cache_lock:
+            while len(self._knowledge_query_cache) >= self._knowledge_cache_max:
+                self._knowledge_query_cache.popitem(last=False)
+            self._knowledge_query_cache[cache_key] = result
         return result
 
     def query_knowledge_by_category(self, category: str, limit: int = 10) -> List[Dict]:
@@ -248,8 +262,8 @@ class YunliKnowledgeDB:
         """更新台词使用次数"""
         conn = self._get_conn()
         conn.execute(
-            "UPDATE dialogues SET usage_count = usage_count + 1, last_used = ? WHERE id = ?",
-            (int(time.time()), dialogue_id),
+            "UPDATE dialogues SET usage_count = usage_count + 1, last_used = datetime('now') WHERE id = ?",
+            (dialogue_id,),
         )
         conn.commit()
 
@@ -369,7 +383,7 @@ class YunliMemoryDB:
 
     # 安全表名白名单（用于 reset_memory 防止注入）
     _ALLOWED_TABLES = frozenset({
-        "interaction_logs", "user_memories", "chat_topics",
+        "interaction_logs", "user_memories", "topic_history",
         "chat_summaries", "open_loops",
     })
 
@@ -380,6 +394,18 @@ class YunliMemoryDB:
             self.db_path = Path(db_path)
 
         self._lock = threading.Lock()
+        # P1-5 修复：记录连接参数，支持自动重连
+        self._connect()
+        # 批量提交缓冲区
+        self._log_buffer = []
+        self._log_batch_size = 10
+        self._init_tables()
+
+    def _connect(self):
+        """建立数据库连接并配置 PRAGMA
+
+        P1-5 修复：抽出连接逻辑，支持连接断开后自动重连。
+        """
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # WAL模式 + 生产级PRAGMA：读写不互斥，减少磁盘同步开销
@@ -387,10 +413,40 @@ class YunliMemoryDB:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA cache_size=-8000")
         self.conn.execute("PRAGMA busy_timeout=5000")
-        # 批量提交缓冲区
-        self._log_buffer = []
-        self._log_batch_size = 10
-        self._init_tables()
+
+    def health_check(self) -> bool:
+        """P1-5 修复：数据库连接健康检查
+
+        通过执行 `SELECT 1` 检测连接是否有效。
+        若连接失效，尝试自动重连。
+
+        Returns:
+            True 表示连接有效（含重连成功），False 表示连接不可恢复
+        """
+        with self._lock:
+            try:
+                self.conn.execute("SELECT 1").fetchone()
+                return True
+            except sqlite3.Error as e:
+                logger.warning("数据库连接失效，尝试重连: %s", e)
+                try:
+                    # 关闭旧连接（可能已失效）
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    # 重新建立连接
+                    self._connect()
+                    # 验证重连是否成功
+                    self.conn.execute("SELECT 1").fetchone()
+                    logger.info("数据库重连成功")
+                    return True
+                except sqlite3.Error as reconnect_err:
+                    logger.error(
+                        "数据库重连失败，连接不可恢复: %s",
+                        reconnect_err, exc_info=True,
+                    )
+                    return False
 
     def _init_tables(self):
         """初始化记忆库表结构"""
@@ -411,30 +467,36 @@ class YunliMemoryDB:
         emotion_state: str,
     ):
         """记录互动日志（批量提交，减少磁盘同步开销）"""
-        self._log_buffer.append((
-            group_id, user_id, user_nickname,
-            message, response, trigger_type, emotion_state,
-        ))
-        if len(self._log_buffer) >= self._log_batch_size:
-            self._flush_logs()
+        with self._lock:
+            self._log_buffer.append((
+                group_id, user_id, user_nickname,
+                message, response, trigger_type, emotion_state,
+            ))
+            if len(self._log_buffer) >= self._log_batch_size:
+                self._flush_logs_locked()
 
     def _flush_logs(self):
-        """批量写入缓冲区中的日志并提交（线程安全）"""
+        """批量写入缓冲区中的日志并提交（自动加锁）"""
+        with self._lock:
+            self._flush_logs_locked()
+
+    def _flush_logs_locked(self):
+        """批量写入缓冲区中的日志并提交（调用方必须已持有 self._lock）"""
         if not self._log_buffer:
             return
-        with self._lock:
-            try:
-                self.conn.executemany(
-                    "INSERT INTO interaction_logs (group_id, user_id, user_nickname, message, response, trigger_type, emotion_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    self._log_buffer,
-                )
-                self.conn.commit()
-                self._log_buffer.clear()
-            except Exception as e:
-                print(f"[云璃数据库] 批量写入互动日志失败: {e}")
-                # 回滚并清空缓冲区，避免内存泄漏
-                self.conn.rollback()
-                self._log_buffer.clear()
+        try:
+            self.conn.executemany(
+                "INSERT INTO interaction_logs (group_id, user_id, user_nickname, message, response, trigger_type, emotion_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                self._log_buffer,
+            )
+            self.conn.commit()
+            self._log_buffer.clear()
+        except Exception as e:
+            logger.error("批量写入互动日志失败: %s", e)
+            self.conn.rollback()
+            # 保留缓冲区数据以便重试，仅清除已超限的部分避免内存泄漏
+            if len(self._log_buffer) > self._log_batch_size * 5:
+                self._log_buffer = self._log_buffer[-self._log_batch_size:]
 
     def flush_logs(self):
         """显式刷新日志缓冲区（供外部调用，如关闭数据库前）"""
@@ -442,50 +504,56 @@ class YunliMemoryDB:
 
     def get_user_stats(self, group_id: str, user_id: str) -> Dict:
         """获取用户在群里的互动统计"""
-        self._flush_logs()
-        cursor = self.conn.execute(
-            "SELECT COUNT(*) as total, MAX(created_at) as last_time FROM interaction_logs WHERE group_id = ? AND user_id = ?",
-            (group_id, user_id),
-        )
-        return dict(cursor.fetchone())
+        with self._lock:
+            self._flush_logs_locked()
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) as total, MAX(created_at) as last_time FROM interaction_logs WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            return dict(cursor.fetchone())
 
     def get_user_recent_messages(
         self, group_id: str, user_id: str, limit: int = 5
     ) -> List[Dict]:
         """获取用户最近的消息记录"""
-        self._flush_logs()
-        cursor = self.conn.execute(
-            "SELECT message, response, emotion_state, created_at FROM interaction_logs WHERE group_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (group_id, user_id, limit),
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            self._flush_logs_locked()
+            cursor = self.conn.execute(
+                "SELECT message, response, emotion_state, created_at FROM interaction_logs WHERE group_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (group_id, user_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_user_emotion_trend(self, group_id: str, user_id: str) -> str:
         """获取用户最近的情绪趋势"""
-        cursor = self.conn.execute(
-            "SELECT emotion_state, COUNT(*) as count FROM interaction_logs WHERE group_id = ? AND user_id = ? AND created_at > datetime('now', '-1 day') GROUP BY emotion_state ORDER BY count DESC LIMIT 1",
-            (group_id, user_id),
-        )
-        row = cursor.fetchone()
-        return row["emotion_state"] if row else "neutral"
+        with self._lock:
+            self._flush_logs_locked()  # 修复：查询前刷新日志缓冲区，与同类查询方法保持一致
+            cursor = self.conn.execute(
+                "SELECT emotion_state, COUNT(*) as count FROM interaction_logs WHERE group_id = ? AND user_id = ? AND created_at > datetime('now', '-1 day') GROUP BY emotion_state ORDER BY count DESC LIMIT 1",
+                (group_id, user_id),
+            )
+            row = cursor.fetchone()
+            return row["emotion_state"] if row else "neutral"
 
     def get_recent_logs(self, group_id: str, limit: int = 5) -> List[Dict]:
         """获取最近群聊记录"""
-        self._flush_logs()
-        cursor = self.conn.execute(
-            "SELECT * FROM interaction_logs WHERE group_id = ? ORDER BY created_at DESC LIMIT ?",
-            (group_id, limit),
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            self._flush_logs_locked()
+            cursor = self.conn.execute(
+                "SELECT * FROM interaction_logs WHERE group_id = ? ORDER BY created_at DESC LIMIT ?",
+                (group_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_group_stats(self, group_id: str) -> Dict:
         """获取群的互动统计"""
-        self._flush_logs()
-        cursor = self.conn.execute(
-            "SELECT COUNT(*) as total, COUNT(DISTINCT user_id) as unique_users FROM interaction_logs WHERE group_id = ?",
-            (group_id,),
-        )
-        return dict(cursor.fetchone())
+        with self._lock:
+            self._flush_logs_locked()
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) as total, COUNT(DISTINCT user_id) as unique_users FROM interaction_logs WHERE group_id = ?",
+                (group_id,),
+            )
+            return dict(cursor.fetchone())
 
     # ========== 话题追踪 ==========
 
@@ -500,97 +568,115 @@ class YunliMemoryDB:
                 - 避免话题过于频繁切换（如群友A说食物，群友B立刻说游戏）
                 - 同一话题内不受冷却限制，正常累加计数
         """
-        now = int(time.time())
+        with self._lock:
+            # P2-1 修复：统一时间戳类型为 TEXT（datetime 格式）
+            # 原 last_active 用 int(time.time())（INTEGER），与 schema 声明的 TIMESTAMP（TEXT）不一致
+            # 冷却时间计算改用 strftime 提取 epoch 秒数
 
-        # 检查当前活跃话题
-        cursor = self.conn.execute(
-            "SELECT id, topic, message_count, participants, last_active FROM topic_history WHERE group_id = ? AND is_active = 1",
-            (group_id,),
-        )
-        active_row = cursor.fetchone()
+            # 检查当前活跃话题
+            cursor = self.conn.execute(
+                "SELECT id, topic, message_count, participants, last_active FROM topic_history WHERE group_id = ? AND is_active = 1",
+                (group_id,),
+            )
+            active_row = cursor.fetchone()
 
-        if active_row:
-            active_topic_name = active_row["topic"]
+            if active_row:
+                active_topic_name = active_row["topic"]
 
-            # 同一话题：正常累加，不受冷却限制
-            if active_topic_name == topic:
-                participants = json.loads(active_row["participants"] or "[]")
+                # 同一话题：正常累加，不受冷却限制
+                if active_topic_name == topic:
+                    participants = json.loads(active_row["participants"] or "[]")
+                    if user_id not in participants:
+                        participants.append(user_id)
+
+                    self.conn.execute(
+                        "UPDATE topic_history SET last_active = datetime('now'), message_count = message_count + 1, participants = ? WHERE id = ?",
+                        (json.dumps(participants), active_row["id"]),
+                    )
+                    self.conn.commit()
+                    return
+
+                # 不同话题：检查冷却时间
+                # P2-1 修复：last_active 现在是 TEXT 格式，用 strftime 转换为 epoch 秒数
+                last_active_str = active_row["last_active"] or ""
+                if last_active_str and last_active_str != "0":
+                    try:
+                        last_active_epoch = self.conn.execute(
+                            "SELECT strftime('%s', ?)", (last_active_str,)
+                        ).fetchone()[0]
+                        now_epoch = self.conn.execute(
+                            "SELECT strftime('%s', 'now')"
+                        ).fetchone()[0]
+                        time_since_last = int(now_epoch) - int(last_active_epoch)
+                    except (ValueError, TypeError):
+                        time_since_last = cooldown_seconds + 1  # 解析失败，跳过冷却
+                else:
+                    time_since_last = cooldown_seconds + 1  # 无上次活跃时间，跳过冷却
+
+                if time_since_last < cooldown_seconds:
+                    # 冷却期内，不切换话题，将消息计入当前活跃话题
+                    participants = json.loads(active_row["participants"] or "[]")
+                    if user_id not in participants:
+                        participants.append(user_id)
+
+                    self.conn.execute(
+                        "UPDATE topic_history SET last_active = datetime('now'), message_count = message_count + 1, participants = ? WHERE id = ?",
+                        (json.dumps(participants), active_row["id"]),
+                    )
+                    self.conn.commit()
+                    return
+
+            # 新话题或冷却期已过：切换话题
+            # 先关闭当前活跃话题
+            self.conn.execute(
+                "UPDATE topic_history SET is_active = 0 WHERE group_id = ? AND is_active = 1",
+                (group_id,),
+            )
+
+            # 检查是否已存在该话题的历史记录（非活跃状态）
+            cursor = self.conn.execute(
+                "SELECT id, message_count, participants FROM topic_history WHERE group_id = ? AND topic = ? AND is_active = 0 ORDER BY last_active DESC LIMIT 1",
+                (group_id, topic),
+            )
+            existing_row = cursor.fetchone()
+
+            if existing_row:
+                # 重新激活已有话题
+                participants = json.loads(existing_row["participants"] or "[]")
                 if user_id not in participants:
                     participants.append(user_id)
 
                 self.conn.execute(
-                    "UPDATE topic_history SET last_active = ?, message_count = message_count + 1, participants = ? WHERE id = ?",
-                    (now, json.dumps(participants), active_row["id"]),
+                    "UPDATE topic_history SET is_active = 1, last_active = datetime('now'), message_count = message_count + 1, participants = ? WHERE id = ?",
+                    (json.dumps(participants), existing_row["id"]),
                 )
-                self.conn.commit()
-                return
-
-            # 不同话题：检查冷却时间
-            last_active = active_row["last_active"] or 0
-            time_since_last = now - last_active
-
-            if time_since_last < cooldown_seconds:
-                # 冷却期内，不切换话题，将消息计入当前活跃话题
-                participants = json.loads(active_row["participants"] or "[]")
-                if user_id not in participants:
-                    participants.append(user_id)
-
+            else:
+                # 创建新话题
                 self.conn.execute(
-                    "UPDATE topic_history SET last_active = ?, message_count = message_count + 1, participants = ? WHERE id = ?",
-                    (now, json.dumps(participants), active_row["id"]),
+                    "INSERT INTO topic_history (group_id, topic, participants) VALUES (?, ?, ?)",
+                    (group_id, topic, json.dumps([user_id])),
                 )
-                self.conn.commit()
-                return
 
-        # 新话题或冷却期已过：切换话题
-        # 先关闭当前活跃话题
-        self.conn.execute(
-            "UPDATE topic_history SET is_active = 0 WHERE group_id = ? AND is_active = 1",
-            (group_id,),
-        )
-
-        # 检查是否已存在该话题的历史记录（非活跃状态）
-        cursor = self.conn.execute(
-            "SELECT id, message_count, participants FROM topic_history WHERE group_id = ? AND topic = ? AND is_active = 0 ORDER BY last_active DESC LIMIT 1",
-            (group_id, topic),
-        )
-        existing_row = cursor.fetchone()
-
-        if existing_row:
-            # 重新激活已有话题
-            participants = json.loads(existing_row["participants"] or "[]")
-            if user_id not in participants:
-                participants.append(user_id)
-
-            self.conn.execute(
-                "UPDATE topic_history SET is_active = 1, last_active = ?, message_count = message_count + 1, participants = ? WHERE id = ?",
-                (now, json.dumps(participants), existing_row["id"]),
-            )
-        else:
-            # 创建新话题
-            self.conn.execute(
-                "INSERT INTO topic_history (group_id, topic, participants) VALUES (?, ?, ?)",
-                (group_id, topic, json.dumps([user_id])),
-            )
-
-        self.conn.commit()
+            self.conn.commit()
 
     def get_active_topic(self, group_id: str) -> Optional[Dict]:
         """获取当前活跃话题"""
-        cursor = self.conn.execute(
-            "SELECT * FROM topic_history WHERE group_id = ? AND is_active = 1 ORDER BY last_active DESC LIMIT 1",
-            (group_id,),
-        )
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT * FROM topic_history WHERE group_id = ? AND is_active = 1 ORDER BY last_active DESC LIMIT 1",
+                (group_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     def get_recent_topics(self, group_id: str, limit: int = 5) -> List[Dict]:
         """获取最近的话题历史"""
-        cursor = self.conn.execute(
-            "SELECT * FROM topic_history WHERE group_id = ? ORDER BY last_active DESC LIMIT ?",
-            (group_id, limit),
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT * FROM topic_history WHERE group_id = ? ORDER BY last_active DESC LIMIT ?",
+                (group_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     # ========== 用户记忆 ==========
 
@@ -623,16 +709,18 @@ class YunliMemoryDB:
             # 检查是否有完全相同的记忆
             for mem in existing_memories:
                 if mem["content"] == content:
-                    new_confidence = min(mem["confidence"] + 1, 10)
+                    # P2-1 修复：SQLite 可能返回字符串类型的 confidence，需强制转换
+                    mem_confidence = int(mem["confidence"]) if mem["confidence"] else 0
+                    new_confidence = min(mem_confidence + 1, 10)
                     if user_nickname:
                         self.conn.execute(
-                            "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = ?, user_nickname = ? WHERE id = ?",
-                            (new_confidence, int(time.time()), user_nickname, mem["id"]),
+                            "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = datetime('now'), user_nickname = ? WHERE id = ?",
+                            (new_confidence, user_nickname, mem["id"]),
                         )
                     else:
                         self.conn.execute(
-                            "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                            (new_confidence, int(time.time()), mem["id"]),
+                            "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?",
+                            (new_confidence, mem["id"]),
                         )
                     self.conn.commit()
                     return {"action": "updated", "needs_consolidation": False}
@@ -644,30 +732,31 @@ class YunliMemoryDB:
                     if len(content) > len(existing_content):
                         if user_nickname:
                             self.conn.execute(
-                                "UPDATE user_memories SET content = ?, confidence = ?, last_accessed = ?, user_nickname = ? WHERE id = ?",
-                                (content, min(confidence + 1, 10), int(time.time()), user_nickname, mem["id"]),
+                                "UPDATE user_memories SET content = ?, confidence = ?, last_accessed = datetime('now'), user_nickname = ? WHERE id = ?",
+                                (content, min(confidence + 1, 10), user_nickname, mem["id"]),
                             )
                         else:
                             self.conn.execute(
-                                "UPDATE user_memories SET content = ?, confidence = ?, last_accessed = ? WHERE id = ?",
-                                (content, min(confidence + 1, 10), int(time.time()), mem["id"]),
+                                "UPDATE user_memories SET content = ?, confidence = ?, last_accessed = datetime('now') WHERE id = ?",
+                                (content, min(confidence + 1, 10), mem["id"]),
                             )
                     else:
-                        new_confidence = min(mem["confidence"] + 1, 10)
+                        mem_confidence = int(mem["confidence"]) if mem["confidence"] else 0
+                        new_confidence = min(mem_confidence + 1, 10)
                         if user_nickname:
                             self.conn.execute(
-                                "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = ?, user_nickname = ? WHERE id = ?",
-                                (new_confidence, int(time.time()), user_nickname, mem["id"]),
+                                "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = datetime('now'), user_nickname = ? WHERE id = ?",
+                                (new_confidence, user_nickname, mem["id"]),
                             )
                         else:
                             self.conn.execute(
-                                "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                                (new_confidence, int(time.time()), mem["id"]),
+                                "UPDATE user_memories SET confidence = ?, access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?",
+                                (new_confidence, mem["id"]),
                             )
                     self.conn.commit()
                     return {"action": "updated", "needs_consolidation": False}
 
-            # 检查是否有冲突记忆（反义词检测）
+            # 检查是否有冲突记忆（反义词检测 + 语义冲突检测）
             conflict_keywords = {
                 "喜欢": "讨厌",
                 "爱": "恨",
@@ -680,21 +769,144 @@ class YunliMemoryDB:
                 "要": "不要",
             }
 
+            # 语义冲突模式：检测隐含的身份/状态矛盾
+            # 注意：每对词都附带"上下文要求"，避免误判
+            # - ("学生", "工作", "身份")：仅在"是学生"/"在工作"等身份表述时才判冲突
+            # - ("男", "女", "性别")：仅在"是男"/"是女"等性别表述时才判冲突
+            semantic_conflicts = [
+                ("学生", "工作", "身份"),
+                ("上学", "上班", "身份"),
+                ("读书", "工作", "身份"),
+                ("单身", "恋爱", "状态"),
+                ("男", "女", "性别"),
+            ]
+
+            # 身份/性别表述的上下文模板：仅在这些句式中才判定冲突
+            # 避免从"我喜欢男的"和"我是女的"误判性别冲突
+            identity_patterns = {
+                "身份": ["我是", "现在是", "毕业后是", "一直是个"],
+                "性别": ["我是", "性别是", "我是男", "我是女"],
+                "状态": ["我是", "现在是", "目前", "单身", "恋爱中"],
+            }
+
+            def _is_identity_statement(content: str, word: str, ctx_type: str) -> bool:
+                """判断 content 中 word 是否出现在身份/性别表述的上下文中
+
+                如"我是学生"中"学生"是身份表述，但"我喜欢学生"中"学生"不是身份表述。
+
+                P0-5 修复：原逻辑仅检查 word 前 5 个字符，存在缺陷：
+                  - "我其实是一个学生" → "学生"前 5 字符是"其实是一个"，
+                    不包含"我是"，不触发身份校验，导致冲突检测失效
+                修复方案：
+                  - 扩大检查范围到 word 前 10 字符（覆盖"我其实是一个"等口语前缀）
+                  - 增加全文匹配模式（如"我是XX""现在是XX""毕业后是XX"）
+                """
+                patterns = identity_patterns.get(ctx_type, [])
+                for pattern in patterns:
+                    # 检查 word 是否紧跟在身份表述之后（允许中间有"一个""一名"等量词）
+                    idx = content.find(word)
+                    if idx < 0:
+                        continue
+                    before = content[:idx]
+                    # P0-5 修复：扩大检查范围到前 10 字符（覆盖"我其实是一个"等口语前缀）
+                    if any(p in before[-10:] for p in patterns):
+                        return True
+                    # 全文匹配：检查 content 是否以"我是/现在是 + word"结尾
+                    # 如"我其实是一个学生"中"学生"前有"是一个"，
+                    # 虽然"我是"不在最后 10 字符的结尾，但"是"在
+                    if any(p in before for p in patterns):
+                        return True
+                return False
+
             has_conflict = False
             for mem in existing_memories:
                 existing_content = mem["content"]
+
+                # 1. 反义词冲突检测
+                # P1-4 修复：原逻辑对"大城市 vs 小城市"等同一修饰对象的不同偏好误判为冲突
+                # 修复方案：
+                #   - 提取冲突词所在的完整修饰对象（冲突词+后续字符）
+                #   - 比较两个修饰对象是否相同：相同则不是冲突（如"大城市"vs"小城市"）
+                #   - 不同则是真正的冲突（如"喜欢猫"vs"讨厌狗"）
                 for pos, neg in conflict_keywords.items():
-                    if (pos in existing_content and neg in content) or (
-                        neg in existing_content and pos in content
-                    ):
-                        self.conn.execute(
-                            "UPDATE user_memories SET status = 'conflicted' WHERE id = ?",
-                            (mem["id"],),
-                        )
-                        has_conflict = True
-                        break
+                    pos_in_existing = pos in existing_content
+                    neg_in_existing = neg in existing_content
+                    pos_in_new = pos in content
+                    neg_in_new = neg in content
+
+                    if (pos_in_existing and neg_in_new) or (neg_in_existing and pos_in_new):
+                        # 长度保护：冲突词对不应占内容主体
+                        shorter = min(len(existing_content), len(content))
+                        if shorter <= 3:
+                            has_conflict = True
+                            break
+
+                        # P1-4 修复：提取并比较冲突词所在的修饰对象
+                        # 判断是否是"大X vs 小X"这类同一对象的不同偏好
+                        def _extract_modifier(text: str, word: str) -> str:
+                            """提取冲突词及其后的修饰对象（如"大城市"中的"大城市"）"""
+                            idx = text.find(word)
+                            if idx < 0:
+                                return word
+                            # 取冲突词及其后最多 4 个字符作为修饰对象
+                            return text[idx:idx + len(word) + 4]
+
+                        if pos_in_existing and neg_in_new:
+                            existing_mod = _extract_modifier(existing_content, pos)
+                            new_mod = _extract_modifier(content, neg)
+                        else:
+                            existing_mod = _extract_modifier(existing_content, neg)
+                            new_mod = _extract_modifier(content, pos)
+
+                        # 检查两个修饰对象是否有公共后缀（如"城市"）
+                        # 如果冲突词后跟相同的字符，说明是同一对象的不同偏好
+                        is_same_object = False
+                        for suffix_len in range(1, min(len(existing_mod), len(new_mod)) + 1):
+                            if existing_mod[-suffix_len:] == new_mod[-suffix_len:]:
+                                # 检查公共后缀是否在冲突词之后（排除冲突词本身相同的情况）
+                                existing_suffix = existing_mod[len(pos):][-suffix_len:] if pos_in_existing else existing_mod[len(neg):][-suffix_len:]
+                                new_suffix = new_mod[len(neg):][-suffix_len:] if pos_in_existing and neg_in_new else new_mod[len(pos):][-suffix_len:]
+                                if existing_suffix and new_suffix and existing_suffix == new_suffix:
+                                    is_same_object = True
+                                    break
+
+                        if not is_same_object:
+                            has_conflict = True
+                            break
+
+                # 2. 语义冲突检测（身份/状态矛盾，带上下文校验）
+                #    仅当双方都是身份/性别表述时才判定冲突
+                #    避免"我是学生干部"和"我在工作"误判
+                #    避免"我喜欢男的"和"我是女的"误判
+                if not has_conflict:
+                    for word_a, word_b, ctx_type in semantic_conflicts:
+                        a_in_existing = word_a in existing_content
+                        b_in_existing = word_b in existing_content
+                        a_in_new = word_a in content
+                        b_in_new = word_b in content
+
+                        # 一方有 word_a，另一方有 word_b
+                        if (a_in_existing and b_in_new) or (b_in_existing and a_in_new):
+                            # 上下文校验：双方都必须是身份/性别表述
+                            if (a_in_existing and b_in_new):
+                                is_existing_identity = _is_identity_statement(existing_content, word_a, ctx_type)
+                                is_new_identity = _is_identity_statement(content, word_b, ctx_type)
+                            else:
+                                is_existing_identity = _is_identity_statement(existing_content, word_b, ctx_type)
+                                is_new_identity = _is_identity_statement(content, word_a, ctx_type)
+
+                            if is_existing_identity and is_new_identity:
+                                has_conflict = True
+                                break
+
+                # 标记冲突的旧记忆
                 if has_conflict:
-                    break
+                    self.conn.execute(
+                        "UPDATE user_memories SET status = 'conflicted' WHERE id = ?",
+                        (mem["id"],),
+                    )
+                    self.conn.commit()
+                    break  # 标记后跳出外层 for
 
             # 检查单用户记忆总数
             total_count = self.conn.execute(
@@ -722,6 +934,166 @@ class YunliMemoryDB:
 
             return {"action": "inserted", "needs_consolidation": needs_consolidation}
 
+    def delete_user_memories(self, group_id: str, user_id: str):
+        """删除指定用户的所有记忆（用于深度整理前清空旧记忆）"""
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM user_memories WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            )
+            self.conn.commit()
+
+    def _safe_rollback(self):
+        """安全回滚事务，记录失败日志并尝试恢复连接状态
+
+        P0-2 修复：ROLLBACK 失败不再静默吞掉（原代码 `except: pass`），
+        而是记录错误日志，便于排查"连接处于脏状态"问题。
+
+        ROLLBACK 失败的常见原因：
+        - 连接已断开（磁盘错误、数据库文件被删）
+        - 事务嵌套（显式 BEGIN 与 sqlite3 隐式事务冲突）
+        - 连接被其他线程锁定
+
+        失败后连接可能处于"cannot start a transaction within a transaction"
+        状态，后续所有操作都会失败。此处记录日志以便运维介入。
+        """
+        try:
+            self.conn.execute("ROLLBACK")
+        except Exception as rollback_err:
+            # ROLLBACK 失败：连接可能处于脏状态，后续操作会失败
+            logger.error(
+                "ROLLBACK 失败，连接可能处于脏状态: %s",
+                rollback_err,
+                exc_info=True,
+            )
+            # 尝试恢复：再次执行 ROLLBACK（处理可能的嵌套事务）
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                # 仍然失败：连接已不可恢复，记录严重警告
+                logger.error(
+                    "ROLLBACK 二次尝试仍失败，连接已不可恢复，"
+                    "建议重启插件或检查数据库完整性"
+                )
+
+    def replace_user_memories(
+        self,
+        group_id: str,
+        user_id: str,
+        new_memories: List[Dict],
+        user_nickname: str = "",
+    ) -> int:
+        """原子性替换用户记忆（用于 LLM 深度整理）
+
+        事务保护流程：
+        1. BEGIN TRANSACTION
+        2. 删除旧记忆
+        3. 写入新记忆
+        4. 检查 written_count：
+           - == 0 → ROLLBACK（保留旧记忆，避免空结果数据丢失）
+           - > 0  → COMMIT
+        5. 任何步骤失败 → ROLLBACK（旧记忆不变）
+
+        P0-1 修复：当 LLM 返回的内容全部被长度校验过滤掉时，
+        written_count 为 0，此时不再 COMMIT（会导致旧记忆被清空），
+        而是 ROLLBACK 保留旧记忆，避免数据丢失。
+
+        Args:
+            new_memories: [{"type": "fact", "content": "...", "confidence": 8}, ...]
+
+        Returns:
+            成功写入的记忆条数（0 表示未写入，旧记忆已保留）；
+            失败时抛出异常，旧记忆保持不变
+
+        注意：此方法跳过 add_memory 的冲突检测和相似度检测，
+        因为整理后的记忆已经是 LLM 去重和解决冲突后的结果。
+        """
+        with self._lock:
+            try:
+                # 开启事务
+                self.conn.execute("BEGIN TRANSACTION")
+
+                # P1-2 修复：删除旧记忆前，按 memory_type 缓存原 expires_at
+                # 避免整理后临时事件（如"今天去爬山"）变为永久记忆
+                # 策略：同类型记忆共享原 expires_at（取最近过期时间）
+                cursor = self.conn.execute(
+                    "SELECT memory_type, expires_at FROM user_memories "
+                    "WHERE group_id = ? AND user_id = ? AND expires_at IS NOT NULL",
+                    (group_id, user_id),
+                )
+                type_expires_map = {}
+                for row in cursor.fetchall():
+                    mem_type = row["memory_type"]
+                    expires_at = row["expires_at"]
+                    # 同类型取最近的过期时间（避免延长有效期）
+                    if mem_type not in type_expires_map or expires_at < type_expires_map[mem_type]:
+                        type_expires_map[mem_type] = expires_at
+
+                # P2-7 修复：缓存旧记忆的最高 access_count，整理后继承
+                # 避免高频访问的记忆整理后 access_count 重置为 1，丢失访问频次信息
+                cursor = self.conn.execute(
+                    "SELECT memory_type, MAX(access_count) as max_count FROM user_memories "
+                    "WHERE group_id = ? AND user_id = ? GROUP BY memory_type",
+                    (group_id, user_id),
+                )
+                type_max_access = {}
+                for row in cursor.fetchall():
+                    type_max_access[row["memory_type"]] = row["max_count"]
+
+                # 删除旧记忆
+                self.conn.execute(
+                    "DELETE FROM user_memories WHERE group_id = ? AND user_id = ?",
+                    (group_id, user_id),
+                )
+
+                # 写入新记忆
+                written_count = 0
+                for mem in new_memories:
+                    mem_type = mem.get("type", "fact")
+                    content = mem.get("content", "").strip()
+                    confidence = min(max(mem.get("confidence", 5), 1), 10)
+
+                    # 内容校验
+                    if not content or len(content) < 2 or len(content) > 50:
+                        continue
+
+                    # P1-2 修复：继承同类型旧记忆的 expires_at
+                    # 如果新记忆显式指定了 expires_at，优先使用新值
+                    expires_at = mem.get("expires_at")
+                    if expires_at is None and mem_type in type_expires_map:
+                        expires_at = type_expires_map[mem_type]
+
+                    # P2-7 修复：继承同类型旧记忆的最高 access_count
+                    # 避免高频访问的记忆整理后 access_count 重置为 1
+                    inherited_access_count = type_max_access.get(mem_type, 1)
+
+                    self.conn.execute(
+                        "INSERT INTO user_memories (group_id, user_id, user_nickname, memory_type, content, confidence, status, expires_at, access_count) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                        (group_id, user_id, user_nickname, mem_type, content, confidence, expires_at, inherited_access_count),
+                    )
+                    written_count += 1
+
+                # P0-1 修复：空结果保护
+                # 如果写入 0 条新记忆，ROLLBACK 保留旧记忆，避免数据丢失
+                # 场景：LLM 返回的内容全部被长度校验过滤掉，或返回空列表
+                if written_count == 0:
+                    logger.warning(
+                        "replace_user_memories: 整理后 0 条有效记忆，"
+                        "ROLLBACK 保留旧记忆 (group_id=%s, user_id=%s, 输入 %d 条)",
+                        group_id, user_id, len(new_memories),
+                    )
+                    self._safe_rollback()
+                    return 0
+
+                # 提交事务
+                self.conn.execute("COMMIT")
+                return written_count
+
+            except Exception:
+                # 回滚事务，旧记忆保持不变
+                self._safe_rollback()
+                raise
+
     def get_memories(
         self,
         group_id: str,
@@ -731,29 +1103,30 @@ class YunliMemoryDB:
         include_outdated: bool = False,
     ) -> List[Dict]:
         """获取用户记忆（自动过滤过期记忆）"""
-        if include_outdated:
-            if memory_type:
-                cursor = self.conn.execute(
-                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND memory_type = ? ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                    (group_id, user_id, memory_type, limit),
-                )
+        with self._lock:
+            if include_outdated:
+                if memory_type:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND memory_type = ? ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                        (group_id, user_id, memory_type, limit),
+                    )
+                else:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                        (group_id, user_id, limit),
+                    )
             else:
-                cursor = self.conn.execute(
-                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                    (group_id, user_id, limit),
-                )
-        else:
-            if memory_type:
-                cursor = self.conn.execute(
-                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND memory_type = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                    (group_id, user_id, memory_type, limit),
-                )
-            else:
-                cursor = self.conn.execute(
-                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                    (group_id, user_id, limit),
-                )
-        return [dict(row) for row in cursor.fetchall()]
+                if memory_type:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND memory_type = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                        (group_id, user_id, memory_type, limit),
+                    )
+                else:
+                    cursor = self.conn.execute(
+                        "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                        (group_id, user_id, limit),
+                    )
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_important_memories(
         self,
@@ -764,28 +1137,29 @@ class YunliMemoryDB:
         prefer_short: bool = True,
     ) -> List[Dict]:
         """获取重要记忆（高可信度，自动过滤过期，可选优先短记忆）"""
-        if prefer_short:
-            cursor = self.conn.execute(
-                "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY LENGTH(content) ASC, confidence DESC, access_count DESC LIMIT ?",
-                (group_id, user_id, min_confidence, limit * 2),
-            )
-            memories = [dict(row) for row in cursor.fetchall()]
-            seen_types = set()
-            filtered = []
-            for mem in memories:
-                mem_type = mem.get("memory_type", "")
-                if mem_type not in seen_types:
-                    seen_types.add(mem_type)
-                    filtered.append(mem)
-                    if len(filtered) >= limit:
-                        break
-            return filtered
-        else:
-            cursor = self.conn.execute(
-                "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, access_count DESC LIMIT ?",
-                (group_id, user_id, min_confidence, limit),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            if prefer_short:
+                cursor = self.conn.execute(
+                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY LENGTH(content) ASC, confidence DESC, access_count DESC LIMIT ?",
+                    (group_id, user_id, min_confidence, limit * 2),
+                )
+                memories = [dict(row) for row in cursor.fetchall()]
+                seen_types = set()
+                filtered = []
+                for mem in memories:
+                    mem_type = mem.get("memory_type", "")
+                    if mem_type not in seen_types:
+                        seen_types.add(mem_type)
+                        filtered.append(mem)
+                        if len(filtered) >= limit:
+                            break
+                return filtered
+            else:
+                cursor = self.conn.execute(
+                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, access_count DESC LIMIT ?",
+                    (group_id, user_id, min_confidence, limit),
+                )
+                return [dict(row) for row in cursor.fetchall()]
 
     def get_group_memories(
         self,
@@ -802,55 +1176,127 @@ class YunliMemoryDB:
             limit: 返回数量限制
             exclude_user_id: 排除特定用户（通常是当前发言者）
         """
-        if exclude_user_id:
-            cursor = self.conn.execute(
-                "SELECT * FROM user_memories WHERE group_id = ? AND user_id != ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                (group_id, exclude_user_id, min_confidence, limit),
-            )
-        else:
-            cursor = self.conn.execute(
-                "SELECT * FROM user_memories WHERE group_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-                (group_id, min_confidence, limit),
-            )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            if exclude_user_id:
+                cursor = self.conn.execute(
+                    "SELECT * FROM user_memories WHERE group_id = ? AND user_id != ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                    (group_id, exclude_user_id, min_confidence, limit),
+                )
+            else:
+                cursor = self.conn.execute(
+                    "SELECT * FROM user_memories WHERE group_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                    (group_id, min_confidence, limit),
+                )
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_memories_by_confidence(
         self, group_id: str, user_id: str, min_confidence: int = 1, limit: int = 10
     ) -> List[Dict]:
         """按可信度获取记忆（不过滤类型，用于测试）"""
-        cursor = self.conn.execute(
-            "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
-            (group_id, user_id, min_confidence, limit),
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT * FROM user_memories WHERE group_id = ? AND user_id = ? AND confidence >= ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY confidence DESC, last_accessed DESC LIMIT ?",
+                (group_id, user_id, min_confidence, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def update_memory_status(self, memory_id: int, status: str):
         """更新记忆状态（active/outdated/conflicted）"""
-        self.conn.execute(
-            "UPDATE user_memories SET status = ? WHERE id = ?", (status, memory_id)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE user_memories SET status = ? WHERE id = ?", (status, memory_id)
+            )
+            self.conn.commit()
 
     def access_memory(self, memory_id: int):
         """访问记忆，更新访问次数"""
-        self.conn.execute(
-            "UPDATE user_memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-            (int(time.time()), memory_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE user_memories SET access_count = access_count + 1, last_accessed = datetime('now') WHERE id = ?",
+                (memory_id,),
+            )
+            self.conn.commit()
+
+    def access_memories_batch(self, memory_ids: list):
+        """P1-6 修复：批量访问记忆，更新访问次数
+
+        替代循环调用 access_memory 的 N+1 查询模式。
+        一次 UPDATE + COMMIT 完成批量更新，减少锁争用和磁盘 I/O。
+
+        Args:
+            memory_ids: 记忆 ID 列表
+        """
+        if not memory_ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" * len(memory_ids))
+            self.conn.execute(
+                f"UPDATE user_memories SET access_count = access_count + 1, last_accessed = datetime('now') "
+                f"WHERE id IN ({placeholders})",
+                (*memory_ids,),
+            )
+            self.conn.commit()
 
     def cleanup_expired_memories(self, group_id: str = None):
         """清理过期记忆"""
-        if group_id:
-            self.conn.execute(
-                "UPDATE user_memories SET status = 'outdated' WHERE group_id = ? AND expires_at IS NOT NULL AND expires_at <= datetime('now')",
-                (group_id,),
-            )
-        else:
-            self.conn.execute(
-                "UPDATE user_memories SET status = 'outdated' WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')"
-            )
-        self.conn.commit()
+        with self._lock:
+            if group_id:
+                self.conn.execute(
+                    "UPDATE user_memories SET status = 'outdated' WHERE group_id = ? AND expires_at IS NOT NULL AND expires_at <= datetime('now')",
+                    (group_id,),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE user_memories SET status = 'outdated' WHERE expires_at IS NOT NULL AND expires_at <= datetime('now')"
+                )
+            self.conn.commit()
+
+    def decay_memory_confidence(self, decay_factor: float = 0.95, min_confidence: int = 5):
+        """置信度衰减：定期对所有活跃记忆的 confidence 衰减
+
+        解决"富者愈富"反馈循环：常被召回的记忆越来越强，新记忆永远召回不出来。
+        衰减后让新记忆有机会浮现。
+
+        P1-1 修复：min_confidence 默认从 3 提升到 5
+          - 原下限 3 低于 get_important_memories / get_group_memories 的默认
+            min_confidence=5，导致衰减触底的记忆无法被检索，形成"软性遗忘"
+          - 提升到 5 后，衰减下限与检索阈值一致，避免记忆被"软删除"
+
+        P1-7 修复：按 memory_type 差异化衰减
+          - fact（身份/职业）：稳定，衰减系数 0.98（衰减慢）
+          - preference（偏好）：较稳定，衰减系数 0.95（默认）
+          - event（事件）：易变，衰减系数 0.90（衰减快）
+          - relationship（关系）：较稳定，衰减系数 0.95（默认）
+          避免身份事实与短期事件同等对待导致重要身份记忆丢失
+
+        P1 新记忆保护期：跳过最近 1 小时内创建的记忆
+          - 避免刚提取的新记忆立即参与衰减
+
+        Args:
+            decay_factor: 衰减系数（0.95 表示每次衰减 5%），用于 preference/relationship
+            min_confidence: 最低置信度下限，低于此值不衰减（避免低置信度记忆被清零）
+        """
+        with self._lock:
+            # P1-7 修复：按 memory_type 差异化衰减
+            # fact（身份/职业）衰减最慢，event（事件）衰减最快
+            type_decay_map = {
+                "fact": min(decay_factor + 0.03, 0.99),  # 0.98，身份事实稳定
+                "preference": decay_factor,               # 0.95，偏好较稳定
+                "relationship": decay_factor,             # 0.95，关系较稳定
+                "event": max(decay_factor - 0.05, 0.80),  # 0.90，事件易变
+            }
+
+            for mem_type, factor in type_decay_map.items():
+                self.conn.execute(
+                    """UPDATE user_memories
+                       SET confidence = MAX(?, CAST(confidence * ? AS INTEGER))
+                       WHERE status = 'active'
+                         AND confidence > ?
+                         AND memory_type = ?
+                         AND created_at < datetime('now', '-1 hour')""",
+                    (min_confidence, factor, min_confidence, mem_type),
+                )
+            self.conn.commit()
 
     # ========== 群聊摘要 ==========
 
@@ -863,97 +1309,195 @@ class YunliMemoryDB:
         message_count: int,
     ):
         """添加群聊摘要"""
-        self.conn.execute(
-            "INSERT INTO chat_summaries (group_id, summary, key_topics, active_users, message_count, start_time) VALUES (?, ?, ?, ?, ?, datetime('now', '-1 hour'))",
-            (
-                group_id,
-                summary,
-                json.dumps(key_topics),
-                json.dumps(active_users),
-                message_count,
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO chat_summaries (group_id, summary, key_topics, active_users, message_count, start_time) VALUES (?, ?, ?, ?, ?, datetime('now', '-1 hour'))",
+                (
+                    group_id,
+                    summary,
+                    json.dumps(key_topics),
+                    json.dumps(active_users),
+                    message_count,
+                ),
+            )
+            self.conn.commit()
 
     def get_latest_summary(self, group_id: str) -> Optional[Dict]:
         """获取最新的群聊摘要"""
-        cursor = self.conn.execute(
-            "SELECT * FROM chat_summaries WHERE group_id = ? ORDER BY end_time DESC LIMIT 1",
-            (group_id,),
-        )
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT * FROM chat_summaries WHERE group_id = ? ORDER BY end_time DESC LIMIT 1",
+                (group_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_recent_interactions(
+        self, group_id: str, hours: int = 1, limit: int = 50
+    ) -> List[Dict]:
+        """获取指定群最近 N 小时的互动日志（用于群聊摘要生成）
+
+        Args:
+            group_id: 群号
+            hours: 查询时间范围（小时）
+            limit: 最大返回条数
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """SELECT * FROM interaction_logs
+                   WHERE group_id = ? AND created_at >= datetime('now', ?)
+                   ORDER BY created_at DESC LIMIT ?""",
+                (group_id, f"-{hours} hours", limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_active_groups(self) -> List[str]:
+        """获取最近有互动的群列表（用于群聊摘要生成）"""
+        with self._lock:
+            cursor = self.conn.execute(
+                """SELECT DISTINCT group_id FROM interaction_logs
+                   WHERE created_at >= datetime('now', '-2 hours')""",
+            )
+            return [row["group_id"] for row in cursor.fetchall()]
 
     def get_db_version(self) -> int:
         """获取数据库版本"""
-        cursor = self.conn.execute("SELECT version FROM db_version LIMIT 1")
-        row = cursor.fetchone()
-        return row["version"] if row else 0
+        with self._lock:
+            cursor = self.conn.execute("SELECT version FROM db_version LIMIT 1")
+            row = cursor.fetchone()
+            return row["version"] if row else 0
 
     # ========== 未完成约定追踪 ==========
 
     def add_open_loop(self, group_id: str, user_id: str, text: str, user_nickname: str = "", expires_days: int = 14):
         """添加未完成约定"""
-        from datetime import datetime, timedelta
-        expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
-        self.conn.execute(
-            "INSERT INTO open_loops (group_id, user_id, user_nickname, text, status, expires_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (group_id, user_id, user_nickname, text, expires_at),
-        )
-        self.conn.commit()
+        with self._lock:
+            from datetime import datetime, timedelta
+            expires_at = (datetime.now() + timedelta(days=expires_days)).isoformat()
+            self.conn.execute(
+                "INSERT INTO open_loops (group_id, user_id, user_nickname, text, status, expires_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (group_id, user_id, user_nickname, text, expires_at),
+            )
+            self.conn.commit()
 
     def complete_open_loop(self, group_id: str, user_id: str, keyword: str = "") -> bool:
         """标记约定为已完成（匹配关键词）"""
-        if keyword:
-            cursor = self.conn.execute(
-                "UPDATE open_loops SET status = 'completed' WHERE group_id = ? AND user_id = ? AND status = 'pending' AND text LIKE ?",
-                (group_id, user_id, f"%{keyword}%"),
-            )
-        else:
-            cursor = self.conn.execute(
-                "UPDATE open_loops SET status = 'completed' WHERE group_id = ? AND user_id = ? AND status = 'pending'",
-                (group_id, user_id),
-            )
-        self.conn.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            if keyword:
+                cursor = self.conn.execute(
+                    "UPDATE open_loops SET status = 'completed' WHERE group_id = ? AND user_id = ? AND status = 'pending' AND text LIKE ?",
+                    (group_id, user_id, f"%{keyword}%"),
+                )
+            else:
+                cursor = self.conn.execute(
+                    "UPDATE open_loops SET status = 'completed' WHERE group_id = ? AND user_id = ? AND status = 'pending'",
+                    (group_id, user_id),
+                )
+            self.conn.commit()
+            return cursor.rowcount > 0
 
     def get_pending_loops(self, group_id: str, user_id: str = "", limit: int = 3) -> List[Dict]:
         """获取未完成的约定"""
-        from datetime import datetime
-        # 先清理过期的约定
-        now = datetime.now().isoformat()
-        self.conn.execute(
-            "UPDATE open_loops SET status = 'expired' WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
-            (now,),
-        )
-        self.conn.commit()
+        with self._lock:
+            from datetime import datetime
+            # 先清理过期的约定
+            now = datetime.now().isoformat()
+            self.conn.execute(
+                "UPDATE open_loops SET status = 'expired' WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            self.conn.commit()
 
-        if user_id:
-            cursor = self.conn.execute(
-                "SELECT * FROM open_loops WHERE group_id = ? AND user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT ?",
-                (group_id, user_id, limit),
-            )
-        else:
-            cursor = self.conn.execute(
-                "SELECT * FROM open_loops WHERE group_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT ?",
-                (group_id, limit),
-            )
-        return [dict(row) for row in cursor.fetchall()]
+            if user_id:
+                cursor = self.conn.execute(
+                    "SELECT * FROM open_loops WHERE group_id = ? AND user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT ?",
+                    (group_id, user_id, limit),
+                )
+            else:
+                cursor = self.conn.execute(
+                    "SELECT * FROM open_loops WHERE group_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT ?",
+                    (group_id, limit),
+                )
+            return [dict(row) for row in cursor.fetchall()]
 
     def cleanup_expired_loops(self):
         """清理所有过期的约定"""
-        from datetime import datetime
-        now = datetime.now().isoformat()
-        self.conn.execute(
-            "DELETE FROM open_loops WHERE status IN ('completed', 'expired', 'cancelled') OR (status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?)",
-            (now,),
-        )
-        self.conn.commit()
+        with self._lock:
+            from datetime import datetime
+            now = datetime.now().isoformat()
+            # 注意：'cancelled' 状态无写入路径（未实现），已从清理条件中移除
+            self.conn.execute(
+                "DELETE FROM open_loops WHERE status IN ('completed', 'expired') OR (status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?)",
+                (now,),
+            )
+            self.conn.commit()
+
+    def cleanup_old_logs(self, retention_days: int = 7):
+        """P1-3 修复：清理过期的互动日志
+
+        interaction_logs 表无 TTL 机制，长期运行后会无限膨胀
+        （每条消息写入一条记录，高活跃群每天可达数万条）。
+
+        定期清理保留最近 N 天的数据，避免：
+        - 磁盘空间持续增长
+        - get_recent_interactions / get_active_groups 查询性能下降
+        - 数据库文件过大影响备份和恢复
+
+        Args:
+            retention_days: 保留天数，默认 7 天
+        """
+        with self._lock:
+            deleted = self.conn.execute(
+                "DELETE FROM interaction_logs WHERE created_at < datetime('now', ?)",
+                (f'-{retention_days} days',),
+            ).rowcount
+            self.conn.commit()
+            if deleted > 0:
+                logger.info(
+                    "清理过期互动日志: 删除 %d 条（保留 %d 天）",
+                    deleted, retention_days,
+                )
+
+    def cleanup_old_summaries(self, keep_count: int = 48):
+        """P1-3 修复：清理过期的群聊摘要
+
+        chat_summaries 表无 TTL 机制，每小时生成 1 条摘要，
+        长期运行后会无限增长（一年 8760 条/群）。
+
+        仅保留每群最近 N 条摘要，避免：
+        - 磁盘空间持续增长
+        - 历史摘要永不检索但仍占用存储
+
+        Args:
+            keep_count: 每群保留的摘要条数，默认 48 条（约 48 小时）
+        """
+        with self._lock:
+            # 删除每群超出 keep_count 的旧摘要
+            # 使用子查询找出每群要保留的 id
+            deleted = self.conn.execute(
+                """DELETE FROM chat_summaries
+                   WHERE id NOT IN (
+                       SELECT id FROM (
+                           SELECT id, ROW_NUMBER() OVER (
+                               PARTITION BY group_id ORDER BY end_time DESC
+                           ) as rn
+                           FROM chat_summaries
+                       ) WHERE rn <= ?
+                   )""",
+                (keep_count,),
+            ).rowcount
+            self.conn.commit()
+            if deleted > 0:
+                logger.info(
+                    "清理过期群聊摘要: 删除 %d 条（每群保留 %d 条）",
+                    deleted, keep_count,
+                )
 
     def close(self):
         """关闭数据库连接（先刷新日志缓冲区）"""
         self._flush_logs()
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
 
 class YunliDatabase:
@@ -994,28 +1538,34 @@ class YunliDatabase:
         return self.memory_db.get_db_version()
 
     def reset_memory(self):
-        """重置记忆库（删除所有动态数据，保留表结构）"""
+        """重置记忆库（删除所有动态数据，保留表结构）
+
+        必须通过 memory_db._lock 保护，遵守 YunliMemoryDB 的锁契约：
+        所有访问 self.conn 的操作都必须在 _lock 保护下进行。
+        """
         try:
             # 清空所有记忆相关表（使用白名单校验防止注入）
             tables = [
                 "interaction_logs",
                 "user_memories",
-                "chat_topics",
+                "topic_history",
                 "chat_summaries",
                 "open_loops",
             ]
-            for table in tables:
-                if table not in self.memory_db._ALLOWED_TABLES:
-                    print(f"[云璃数据库] 跳过非白名单表: {table}")
-                    continue
-                try:
-                    self.memory_db.conn.execute(f"DELETE FROM \"{table}\"")
-                except sqlite3.OperationalError:
-                    pass  # 表可能不存在
-            self.memory_db.conn.commit()
+            memory_db = self.memory_db
+            with memory_db._lock:
+                for table in tables:
+                    if table not in memory_db._ALLOWED_TABLES:
+                        logger.warning("跳过非白名单表: %s", table)
+                        continue
+                    try:
+                        memory_db.conn.execute(f"DELETE FROM \"{table}\"")
+                    except sqlite3.OperationalError:
+                        pass  # 表可能不存在
+                memory_db.conn.commit()
             return True
         except Exception as e:
-            print(f"[云璃数据库] 重置记忆库失败: {e}")
+            logger.error("重置记忆库失败: %s", e)
             return False
 
     def close(self):

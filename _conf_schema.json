@@ -368,5 +368,90 @@
       "max": 5000,
       "step": 500
     }
+  },
+  "evolution_enabled": {
+    "description": "【Darwin进化】启用Darwin自进化系统",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后可通过命令或定时触发文本资产自进化（9维度评分+棘轮机制）"
+  },
+  "evolution_admin_qqs": {
+    "description": "【Darwin进化】指令白名单(QQ号)",
+    "type": "string",
+    "default": "",
+    "hint": "允许触发 /云璃进化 指令的QQ号列表，逗号分隔(如 12345,67890)。留空=不限制，任何人都可触发(注意安全风险)"
+  },
+  "evolution_auto_trigger": {
+    "description": "【Darwin进化】自动触发进化",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后每隔指定小时自动运行一次进化循环"
+  },
+  "evolution_trigger_interval_hours": {
+    "description": "【Darwin进化】自动触发间隔(小时)",
+    "type": "int",
+    "default": 24,
+    "hint": "自动触发进化的时间间隔",
+    "slider": {
+      "min": 6,
+      "max": 168,
+      "step": 6
+    }
+  },
+  "evolution_max_iterations": {
+    "description": "【Darwin进化】最大迭代次数",
+    "type": "int",
+    "default": 3,
+    "hint": "每个资产每轮进化的最大改进尝试次数",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "evolution_min_improvement": {
+    "description": "【Darwin进化】最小改进阈值",
+    "type": "float",
+    "default": 0.5,
+    "hint": "总分提升低于此值视为无效改进，触发棘轮回滚",
+    "slider": {
+      "min": 0.1,
+      "max": 5.0,
+      "step": 0.1
+    }
+  },
+  "evolution_assets": {
+    "description": "【Darwin进化】进化资产范围",
+    "type": "list",
+    "default": ["system_prompt", "review_rules", "filter_rules", "emotion_templates", "language_style"],
+    "hint": "要纳入进化优化的文本资产列表。可选: system_prompt, review_rules, filter_rules, emotion_templates, language_style"
+  },
+  "phase2_enabled": {
+    "description": "【Darwin Phase2】启用模式发现系统",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后采集对话日志，通过LLM自动发现过滤逃逸、情感误判、风格偏移等模式"
+  },
+  "phase2_log_sample_rate": {
+    "description": "【Darwin Phase2】日志采样率",
+    "type": "float",
+    "default": 0.1,
+    "hint": "对话日志的采样比例(0-1)。0.1=10%采样，避免存储膨胀",
+    "slider": {
+      "min": 0.01,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "phase2_auto_analyze_hours": {
+    "description": "【Darwin Phase2】自动分析间隔(小时)",
+    "type": "int",
+    "default": 24,
+    "hint": "自动触发模式发现的时间间隔。0=不自动触发",
+    "slider": {
+      "min": 0,
+      "max": 168,
+      "step": 6
+    }
   }
 }

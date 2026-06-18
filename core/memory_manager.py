@@ -8,11 +8,14 @@
 
 import asyncio
 import json
+import logging
 import random
 import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 # ========== 预编译正则（模块加载时编译一次，避免每次调用时重复编译） ==========
@@ -26,6 +29,12 @@ _PREFERENCE_PATTERNS = [
     (re.compile(r"我最(?:喜欢|爱|讨厌)(?:的是|就是)?(.+?)[，。！]"), "preference", 7),
     (re.compile(r"我对(.+?)(?:很|挺|非常|特别)(?:感兴趣|有兴趣|喜欢)[，。！]"), "preference", 6),
     (re.compile(r"我(?:沉迷|热衷|迷上|入坑)(?:了)?(.+?)[，。！]"), "preference", 6),
+    # P2-6 修复：扩展偏好提取规则，覆盖更多口语化表达
+    (re.compile(r"我(?:偏好|倾向|钟情|偏爱|偏好)(.+?)[，。！]"), "preference", 6),
+    (re.compile(r"我(?:比较|更)(?:喜欢|爱|偏好)(.+?)[，。！]"), "preference", 6),
+    (re.compile(r"我(?:一般|平时|通常)(?:都)?(?:喜欢|爱|吃|喝|玩|看|听)(.+?)[，。！]"), "preference", 5),
+    (re.compile(r"我(?:特别|超|巨|贼|可)(?:喜欢|爱|想)(.+?)[，。！]"), "preference", 7),
+    (re.compile(r"我(?:不太|不怎么|不大)(?:喜欢|爱|感兴趣)(.+?)[，。！]"), "preference", 6),
 ]
 
 # 身份/职业提取模式
@@ -35,6 +44,12 @@ _FACT_PATTERNS = [
     (re.compile(r"我(?:学|读|上)(?:的是)?(.+?)(?:专业|系|班|学校|大学)[，。！]"), "fact", 5),
     (re.compile(r"我(?:来自|是)(.+?)(?:人|的)[，。！]"), "fact", 5),
     (re.compile(r"我(?:住在|在)(.+?)(?:附近|旁边|里面|这里)[，。！]"), "fact", 5),
+    # P2-6 修复：扩展身份提取规则
+    (re.compile(r"我(?:叫|姓)(.+?)[，。！]"), "fact", 6),
+    (re.compile(r"我(?:今年|现在)(\d+岁|多大)[，。！]?"), "fact", 5),
+    (re.compile(r"我(?:是男|是女|男生|女生|男孩子|女孩子)"), "fact", 7),
+    (re.compile(r"我(?:毕业|读完)(?:了|于)?(.+?)[，。！]"), "fact", 5),
+    (re.compile(r"我(?:做|干|搞)(?:的是)?(.+?)(?:的|工作|活)[，。！]"), "fact", 5),
 ]
 
 # 事件/状态提取模式
@@ -81,6 +96,38 @@ class MemoryManager:
     - 第二层：LLM深度整理（定时，批量处理）
     """
 
+    # 轻量提取否定词表：匹配到这些词时跳过提取，避免误提取口语化表达
+    _EXTRACTION_STOP_WORDS = frozenset({
+        # "我是"类误提取
+        "是说", "是说啊", "是说呢", "是说吧", "是说嘛", "是说哦",
+        "是说不是", "是说真的", "是说对吧",
+        # "我会"类误提取
+        "想你的", "想你的", "想办法", "想你了",
+        "好好照顾", "好好珍惜",
+        # "我有"类误提取
+        "个问题", "个想法", "个建议", "个疑问", "个请求",
+        "点事", "点想法", "点意见",
+        # "记得"类误提取（约定误提取）
+        "他说过", "她说过", "别人说", "有人说",
+    })
+
+    # 上下文否定/疑问词：提取内容前后出现这些词时跳过提取
+    # 避免从"我不是学生""我是说真的""你觉得我是谁"中误提取
+    _CONTEXT_NEGATION_WORDS = frozenset({
+        "不是", "不", "没", "没有", "别", "莫", "勿", "非",
+        "难道", "是否", "是不是", "会不会", "能不能",
+        "觉得", "认为", "以为", "感觉", "好像", "似乎",
+        "如果", "假如", "要是", "万一",
+    })
+
+    # 提取内容开头禁用词：以这些词开头的提取内容视为误提取
+    # 如"说真的喜欢这个"以"说"开头，是口语化表达而非真实身份
+    _CONTENT_PREFIX_BLACKLIST = frozenset({
+        "说", "觉得", "认为", "感觉", "以为", "好像", "似乎",
+        "真的", "确实", "其实", "反正", "毕竟",
+        "不是", "没有", "别", "难道",
+    })
+
     def __init__(self, db, config: dict = None, context=None):
         self.db = db
         self.config = config or {}
@@ -114,6 +161,10 @@ class MemoryManager:
         # LLM整理并发控制：同时只允许一个整理任务运行
         self._consolidation_semaphore = asyncio.Semaphore(1)
 
+        # P0-3 修复：LLM 调用超时保护（秒）
+        # 避免因 LLM 提供方挂起导致信号量永久占用、整理任务永久阻塞
+        self._llm_timeout_seconds = self.config.get("llm_timeout_seconds", 30.0)
+
         # 后台任务生命周期管理
         self._background_tasks: Set[asyncio.Task] = set()
 
@@ -125,7 +176,7 @@ class MemoryManager:
         def _done_callback(t: asyncio.Task):
             self._background_tasks.discard(t)
             if not t.cancelled() and t.exception():
-                print(f"[云璃记忆] 后台任务异常: {t.exception()}")
+                logger.error("后台任务异常: %s", t.exception())
 
         task.add_done_callback(_done_callback)
         return task
@@ -156,10 +207,11 @@ class MemoryManager:
 
             # 3. 第一层：规则式轻量提取
             if self._lightweight_enabled:
-                self.extract_memory_lightweight(group_id, user_id, message)
+                self.extract_memory_lightweight(group_id, user_id, message, user_nickname)
 
             # 4. 第二层：LLM深度整理（后台任务，带防抖）
-            if self._memory_llm_enabled:
+            #    旁听模式（response 为空）不触发深度整理，避免空回复污染整理队列
+            if self._memory_llm_enabled and response:
                 now = time.time()
                 if now - self._last_buffer_task_time >= self._buffer_task_debounce:
                     self._last_buffer_task_time = now
@@ -170,7 +222,7 @@ class MemoryManager:
                     )
 
         except Exception as e:
-            print(f"[云璃记忆] 记录互动失败: {e}")
+            logger.error("记录互动失败: %s", e)
 
     # ========== 消息缓冲与LLM深度整理 ==========
 
@@ -258,7 +310,7 @@ class MemoryManager:
                 if not provider:
                     return
 
-                print(f"[云璃记忆] 开始LLM深度整理，共 {len(conversations)} 条对话")
+                logger.info("开始LLM深度整理，共 %d 条对话", len(conversations))
 
                 user_conversations = {}
                 for conv in conversations:
@@ -278,10 +330,10 @@ class MemoryManager:
                     )
                     total_memories += len(memories)
 
-                print(f"[云璃记忆] LLM深度整理完成，共提取 {total_memories} 条记忆")
+                logger.info("LLM深度整理完成，共提取 %d 条记忆", total_memories)
 
             except Exception as e:
-                print(f"[云璃记忆] LLM深度整理失败: {e}")
+                logger.error("LLM深度整理失败: %s", e)
 
     async def _deep_extract_with_llm(
         self, provider, group_id: str, user_id: str,
@@ -292,7 +344,9 @@ class MemoryManager:
         total_chars = 0
         max_dialog_chars = 2000 if len(dialogs) > 50 else 3000
         for d in reversed(dialogs):
-            line = f"用户: {d['message']}\n云璃: {d['response']}"
+            # 标注用户昵称，避免群聊中多用户消息混淆
+            nick = d.get("user_nickname", "") or d.get("user_id", "用户")[:4]
+            line = f"{nick}: {d['message']}\n云璃: {d['response']}"
             if total_chars + len(line) > max_dialog_chars:
                 break
             dialog_lines.append(line)
@@ -344,8 +398,12 @@ class MemoryManager:
 请输出整理后的记忆JSON数组。只输出新发现或需要更新的记忆。"""
 
         try:
-            llm_response = await provider.text_chat(
-                prompt=user_prompt, system_prompt=system_prompt,
+            # P0-3 修复：添加超时保护，避免 LLM 挂起导致信号量永久占用
+            llm_response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=user_prompt, system_prompt=system_prompt,
+                ),
+                timeout=self._llm_timeout_seconds,
             )
             if not llm_response or not llm_response.completion_text:
                 return []
@@ -379,8 +437,14 @@ class MemoryManager:
 
             return written
 
+        except asyncio.TimeoutError:
+            logger.warning(
+                "LLM深度提取超时（%s秒），跳过本次整理: %s",
+                self._llm_timeout_seconds, user_nickname,
+            )
+            return []
         except Exception as e:
-            print(f"[云璃记忆] LLM深度提取失败 ({user_nickname}): {e}")
+            logger.error("LLM深度提取失败 (%s): %s", user_nickname, e)
             return []
 
     def _parse_memory_json(self, text: str) -> List[Dict]:
@@ -432,23 +496,64 @@ class MemoryManager:
 
     # ========== 轻量级记忆提取（第一层） ==========
 
-    def extract_memory_lightweight(self, group_id: str, user_id: str, message: str):
+    def extract_memory_lightweight(self, group_id: str, user_id: str, message: str,
+                                    user_nickname: str = ""):
         """轻量级记忆提取：零成本正则匹配高频简单模式
 
         优化：不再"命中一条就 return"，改为收集最多 3 条记忆，
         确保偏好/身份/事件/能力/约定 五类都能独立检测。
+
+        P2-3 修复：添加 try/except 保护，DB 异常不再中断整条链路。
         """
         if not self._lightweight_enabled:
             return
 
-        def _try_add_memory(mem_type, content, confidence=5, expires_at=None):
-            """尝试添加记忆，成功返回 True"""
+        try:
+            self._extract_memory_lightweight_impl(group_id, user_id, message, user_nickname)
+        except Exception as e:
+            logger.error("轻量记忆提取失败: %s", e, exc_info=True)
+
+    def _extract_memory_lightweight_impl(self, group_id: str, user_id: str, message: str,
+                                          user_nickname: str = ""):
+
+        def _try_add_memory(mem_type, content, confidence=5, expires_at=None, match=None):
+            """尝试添加记忆，成功返回 True
+
+            Args:
+                match: 正则匹配对象，用于上下文校验（检查匹配位置前后的否定/疑问词）
+            """
             if not (2 <= len(content) <= 15):
                 return False
+            # 否定词过滤：跳过口语化误提取
+            for stop_word in MemoryManager._EXTRACTION_STOP_WORDS:
+                if stop_word in content:
+                    return False
+            # 提取内容开头禁用词校验：避免"说真的喜欢这个"等口语化误提取
+            for prefix in MemoryManager._CONTENT_PREFIX_BLACKLIST:
+                if content.startswith(prefix):
+                    return False
+            # 上下文否定/疑问词校验
+            # P0-4 修复：原逻辑仅检查匹配位置前 3 字符，存在两个缺陷：
+            #   1. 范围太窄，"真的吗？我是学生"中"真的"在位置 0-1，
+            #      "我是"在位置 4-5，context_before="的吗？"不包含"真的"
+            #   2. 未检查匹配内容内部，"我是不是学生"会匹配并提取"是不是学生"
+            # 修复方案：
+            #   - 扩大前缀检查范围到 8 字符（覆盖常见口语前缀）
+            #   - 增加对匹配内容本身的否定词检查（如"是不是""会不会"）
+            if match is not None:
+                start = match.start()
+                # 扩大前缀检查范围到 8 字符
+                context_before = message[max(0, start - 8):start]
+                # 匹配到的完整文本（含前缀"我是""我喜欢"等）
+                matched_text = match.group(0)
+                for neg_word in MemoryManager._CONTEXT_NEGATION_WORDS:
+                    if neg_word in context_before or neg_word in matched_text:
+                        return False
             result = self.db.add_memory(
                 group_id, user_id, mem_type, content,
                 confidence=confidence, expires_at=expires_at,
                 max_memories_per_user=self._max_memories_per_user,
+                user_nickname=user_nickname,
             )
             if result.get("needs_consolidation"):
                 self._safe_create_task(
@@ -476,6 +581,7 @@ class MemoryManager:
                     if _try_add_memory(
                         mem_type, content, confidence,
                         _get_temp_expires() if _check_temporary() else None,
+                        match=match,
                     ):
                         extracted += 1
                     break  # 每类最多一条
@@ -486,7 +592,7 @@ class MemoryManager:
                 match = pattern.search(message)
                 if match:
                     content = match.group(1).strip()
-                    if _try_add_memory(mem_type, content, confidence):
+                    if _try_add_memory(mem_type, content, confidence, match=match):
                         extracted += 1
                     break
 
@@ -498,6 +604,7 @@ class MemoryManager:
                     content = match.group(1).strip()
                     if _try_add_memory(
                         mem_type, content, confidence, _get_temp_expires(expire_days),
+                        match=match,
                     ):
                         extracted += 1
                     break
@@ -508,7 +615,7 @@ class MemoryManager:
                 match = pattern.search(message)
                 if match:
                     content = match.group(1).strip()
-                    if _try_add_memory(mem_type, content, confidence):
+                    if _try_add_memory(mem_type, content, confidence, match=match):
                         extracted += 1
                     break
 
@@ -540,7 +647,7 @@ class MemoryManager:
         self._memory_consolidation_in_progress.add(consolidation_key)
 
         try:
-            print(f"[云璃记忆] 触发记忆整理: {consolidation_key}")
+            logger.info("触发记忆整理: %s", consolidation_key)
             all_memories = self.db.get_memories(
                 group_id, user_id, limit=200, include_outdated=False
             )
@@ -598,12 +705,23 @@ class MemoryManager:
             try:
                 provider = self.context.get_provider() if self.context else None
                 if not provider:
-                    print(f"[云璃记忆] 未获取到LLM Provider，跳过整理")
+                    logger.warning("未获取到LLM Provider，跳过整理")
                     return
 
-                response = await provider.text_chat(
-                    prompt=user_prompt, system_prompt=system_prompt,
-                )
+                # P0-3 修复：添加超时保护，避免 LLM 挂起导致整理任务永久阻塞
+                try:
+                    response = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=user_prompt, system_prompt=system_prompt,
+                        ),
+                        timeout=self._llm_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "LLM整理超时（%s秒），跳过本次整理: %s",
+                        self._llm_timeout_seconds, consolidation_key,
+                    )
+                    return
 
                 llm_response = ""
                 if hasattr(response, "completion_text"):
@@ -617,40 +735,179 @@ class MemoryManager:
 
                 consolidated = self._parse_memory_json(llm_response)
                 if not consolidated:
-                    print(f"[云璃记忆] 整理未返回有效结果，跳过")
+                    logger.warning("整理未返回有效结果，跳过")
                     return
 
                 try:
-                    self.db.memory_db.conn.execute("BEGIN TRANSACTION")
-                    self.db.memory_db.conn.execute(
-                        "DELETE FROM user_memories WHERE group_id = ? AND user_id = ?",
-                        (group_id, user_id),
+                    # 事务保护：使用 replace_user_memories 原子性替换
+                    # 失败时旧记忆保持不变，避免整理失败导致数据丢失
+                    # P0-1 修复：written_count == 0 时旧记忆已保留（ROLLBACK）
+                    written_count = self.db.memory_db.replace_user_memories(
+                        group_id, user_id, consolidated, user_nickname
                     )
-                    written_count = 0
-                    for mem in consolidated:
-                        mem_type = mem.get("type", "fact")
-                        content = mem.get("content", "").strip()
-                        confidence = min(max(mem.get("confidence", 5), 1), 10)
-                        if not content or len(content) < 2 or len(content) > 50:
-                            continue
-                        self.db.memory_db.conn.execute(
-                            "INSERT INTO user_memories (group_id, user_id, user_nickname, memory_type, content, confidence) VALUES (?, ?, ?, ?, ?, ?)",
-                            (group_id, user_id, user_nickname, mem_type, content, confidence),
+                    if written_count == 0:
+                        logger.warning(
+                            "整理后 0 条有效记忆，旧记忆 %d 条已保留: %s",
+                            len(all_memories), consolidation_key,
                         )
-                        written_count += 1
-                    self.db.memory_db.conn.commit()
-                    print(f"[云璃记忆] 整理完成: {len(all_memories)} 条 → {written_count} 条")
+                    else:
+                        logger.info(
+                            "整理完成: %d 条 → %d 条 (%s)",
+                            len(all_memories), written_count, consolidation_key,
+                        )
                 except Exception as e:
-                    self.db.memory_db.conn.rollback()
-                    print(f"[云璃记忆] 整理事务失败，已回滚: {e}")
+                    logger.error("整理事务失败（旧记忆已保留）: %s", e)
 
             except Exception as e:
-                print(f"[云璃记忆] LLM调用失败: {e}")
+                logger.error("LLM调用失败: %s", e)
 
         finally:
             self._memory_consolidation_in_progress.discard(consolidation_key)
 
     def cleanup_expired(self):
-        """清理过期记忆和约定"""
+        """清理过期记忆和约定，并执行置信度衰减"""
         self.db.cleanup_expired_memories()
         self.db.cleanup_expired_loops()
+        # P1-3 修复：清理过期的互动日志和群聊摘要，避免表无限膨胀
+        try:
+            self.db.memory_db.cleanup_old_logs(retention_days=7)
+        except Exception as e:
+            logger.error("清理互动日志失败: %s", e)
+        try:
+            self.db.memory_db.cleanup_old_summaries(keep_count=48)
+        except Exception as e:
+            logger.error("清理群聊摘要失败: %s", e)
+        # 置信度衰减：打破"富者愈富"反馈循环，让新记忆有机会浮现
+        # P1-1 修复：min_confidence 从 3 提升到 5，与检索阈值一致，避免"软性遗忘"
+        try:
+            self.db.memory_db.decay_memory_confidence(
+                decay_factor=0.95, min_confidence=5
+            )
+        except Exception as e:
+            logger.error("置信度衰减失败: %s", e)
+
+    async def generate_group_summaries(self):
+        """为所有活跃群生成群聊摘要
+
+        定期调用（如每小时），从 interaction_logs 提取最近 1 小时的对话，
+        调用 LLM 生成摘要，写入 chat_summaries 表。
+        这样云璃在被@时能引用群聊摘要上下文，了解群聊整体走向。
+        """
+        if not self._memory_llm_enabled or not self.context:
+            return
+
+        try:
+            active_groups = self.db.memory_db.get_active_groups()
+            for group_id in active_groups:
+                # 检查是否已有最近 1 小时内的摘要，避免重复生成
+                latest = self.db.memory_db.get_latest_summary(group_id)
+                if latest and latest.get("end_time"):
+                    try:
+                        end_time = datetime.strptime(
+                            latest["end_time"], "%Y-%m-%d %H:%M:%S"
+                        )
+                        if (datetime.now() - end_time).total_seconds() < 3600:
+                            continue  # 1 小时内已生成过摘要
+                    except Exception:
+                        pass
+
+                await self._generate_summary_for_group(group_id)
+        except Exception as e:
+            logger.error("群聊摘要生成失败: %s", e)
+
+    async def _generate_summary_for_group(self, group_id: str):
+        """为单个群生成摘要"""
+        try:
+            interactions = self.db.memory_db.get_recent_interactions(
+                group_id, hours=1, limit=50
+            )
+            if len(interactions) < 5:
+                return  # 互动太少，不值得生成摘要
+
+            # 构建对话文本
+            dialogue_lines = []
+            active_users = set()
+            for log in interactions:
+                nickname = log.get("user_nickname", "群友")
+                message = log.get("message", "")
+                if message:
+                    dialogue_lines.append(f"{nickname}: {message}")
+                    active_users.add(nickname)
+            dialogue_text = "\n".join(dialogue_lines[-30:])  # 最多 30 条
+
+            system_prompt = """你是群聊摘要助手。请根据以下群聊记录生成简洁摘要。
+
+输出格式（JSON）：
+{
+  "summary": "群聊主要话题和氛围的简短描述（30字以内）",
+  "key_topics": ["话题1", "话题2"]
+}
+
+注意：
+- summary 简洁概括群聊走向
+- key_topics 提取 1-3 个核心话题
+- 忽略无意义的寒暄和表情"""
+
+            user_prompt = f"群号 {group_id} 最近 1 小时的对话记录：\n\n{dialogue_text}\n\n请生成摘要。"
+
+            provider = self.context.get_provider() if self.context else None
+            if not provider:
+                return
+
+            # P0-3 修复：添加超时保护，避免 LLM 挂起导致摘要生成永久阻塞
+            try:
+                response = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=user_prompt, system_prompt=system_prompt,
+                    ),
+                    timeout=self._llm_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "群聊摘要生成超时（%s秒），跳过群 %s",
+                    self._llm_timeout_seconds, group_id,
+                )
+                return
+
+            llm_response = ""
+            if hasattr(response, "completion_text"):
+                llm_response = response.completion_text
+            elif isinstance(response, str):
+                llm_response = response
+
+            # 解析 JSON 响应
+            import json as _json
+            try:
+                # 尝试提取 JSON 块
+                json_start = llm_response.find("{")
+                json_end = llm_response.rfind("}") + 1
+                if json_start >= 0 and json_end > json_start:
+                    data = _json.loads(llm_response[json_start:json_end])
+                    summary = data.get("summary", "")
+                    key_topics = data.get("key_topics", [])
+                    if summary:
+                        self.db.memory_db.add_summary(
+                            group_id=group_id,
+                            summary=summary,
+                            key_topics=key_topics,
+                            active_users=list(active_users),
+                            message_count=len(interactions),
+                        )
+                        logger.info("群 %s 摘要生成: %s", group_id, summary)
+            except _json.JSONDecodeError:
+                # P2-9 修复：JSON 解析失败时降级为纯文本摘要
+                logger.warning("群聊摘要 JSON 解析失败，尝试降级处理: %s", llm_response[:100])
+                # 降级：直接使用 LLM 响应的前 30 字作为摘要
+                fallback_summary = llm_response.strip()[:30]
+                if fallback_summary and len(fallback_summary) >= 5:
+                    self.db.memory_db.add_summary(
+                        group_id=group_id,
+                        summary=fallback_summary,
+                        key_topics=[],
+                        active_users=list(active_users),
+                        message_count=len(interactions),
+                    )
+                    logger.info("群 %s 降级摘要: %s", group_id, fallback_summary)
+
+        except Exception as e:
+            logger.error("群 %s 摘要生成失败: %s", group_id, e)

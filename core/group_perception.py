@@ -8,8 +8,11 @@
 
 import re
 import time
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class GroupPerception:
@@ -69,9 +72,17 @@ class GroupPerception:
     def _enforce_cache_limit(self, cache_dict: dict, group_id: str):
         """确保缓存字典不超过最大群数量，超限时淘汰最久未更新的条目
 
-        Returns:
-            True 表示当前群是新插入（触发淘汰检查），False 表示已有条目
+        同时清理过期条目（TTL 检查）。
         """
+        # TTL 过期清理
+        now = time.time()
+        expired_keys = [
+            gid for gid, val in cache_dict.items()
+            if isinstance(val, dict) and (now - val.get("last_updated", 0)) > self._cache_ttl_seconds
+        ]
+        for gid in expired_keys:
+            del cache_dict[gid]
+
         if group_id in cache_dict:
             return False
 
@@ -86,11 +97,15 @@ class GroupPerception:
             del cache_dict[oldest]
         return True
 
+    # 单字关键词黑名单：这些单字在群聊中极易误匹配，仅在多字匹配未命中时作为兜底
+    # 且需要满足最低出现次数阈值才生效
+    SINGLE_CHAR_BLACKLIST = {"打", "菜", "肉", "茶", "玩", "冷", "热", "累", "烦"}
+
     def detect_topic(self, message: str) -> str:
         """检测当前话题（增强版分词匹配）
 
         1. 先尝试最长匹配（2字+关键词优先）
-        2. 再尝试单字匹配
+        2. 再尝试单字匹配（排除黑名单中的易误匹配单字）
         3. 返回得分最高的话题
         """
         if not message:
@@ -103,10 +118,10 @@ class GroupPerception:
             if len(keyword) >= 2 and keyword in message:
                 topic_scores[topic] = topic_scores.get(topic, 0) + len(keyword)
 
-        # 第二轮：单字匹配（仅对未匹配到时进行）
+        # 第二轮：单字匹配（仅对未匹配到时进行，排除黑名单单字）
         if not topic_scores:
             for keyword, topic in self.TOPIC_KEYWORDS.items():
-                if len(keyword) == 1 and keyword in message:
+                if len(keyword) == 1 and keyword not in self.SINGLE_CHAR_BLACKLIST and keyword in message:
                     topic_scores[topic] = topic_scores.get(topic, 0) + 1
 
         if not topic_scores:
@@ -189,7 +204,7 @@ class GroupPerception:
         ][-max_threads:]
 
     def get_topic_threads_formatted(self, group_id: str) -> str:
-        """格式化话题线程用于提示词"""
+        """格式化话题线程用于提示词（含参与者信息）"""
         if group_id not in self._topic_thread_cache:
             return ""
         threads = self._topic_thread_cache[group_id]
@@ -198,8 +213,49 @@ class GroupPerception:
         from collections import Counter
         topic_counts = Counter(t[0] for t in threads)
         hot_topics = topic_counts.most_common(3)
-        parts = [f"{t}({c}条)" for t, c in hot_topics]
+
+        parts = []
+        for topic, count in hot_topics:
+            # 提取该话题的参与者
+            participants = [t[1] for t in threads if t[0] == topic]
+            unique_participants = list(dict.fromkeys(participants))[:3]  # 去重保序，最多3人
+            if len(unique_participants) >= 2:
+                parts.append(f"{topic}({count}条，{unique_participants[0]}和{unique_participants[1]}在聊)")
+            elif len(unique_participants) == 1:
+                parts.append(f"{topic}({count}条，{unique_participants[0]}在聊)")
+            else:
+                parts.append(f"{topic}({count}条)")
+
         return "当前活跃话题：" + "、".join(parts)
+
+    def build_recent_speakers_summary(self, group_id: str, max_speakers: int = 5) -> str:
+        """构建最近发言者摘要（谁在跟谁说话）
+
+        利用话题线程缓存中的发言者信息，生成群聊对话结构感知。
+        """
+        if group_id not in self._topic_thread_cache:
+            return ""
+        threads = self._topic_thread_cache[group_id]
+        if not threads:
+            return ""
+
+        # 取最近的发言记录
+        recent = threads[-max_speakers:]
+        if len(recent) < 2:
+            return ""
+
+        # 构建发言者序列
+        speaker_sequence = []
+        seen_speakers = []
+        for topic, speaker, timestamp in recent:
+            if speaker and speaker not in seen_speakers[-3:]:  # 避免同一人连续出现
+                speaker_sequence.append(f"{speaker}在聊{topic}")
+                seen_speakers.append(speaker)
+
+        if not speaker_sequence:
+            return ""
+
+        return "最近群聊动态：" + "，".join(speaker_sequence[-3:])
 
     # ========== 场景信号提取 ==========
 
@@ -257,7 +313,7 @@ class GroupPerception:
                 signals["mention_bot_name"] = True
 
         except Exception as e:
-            print(f"[云璃场景] 信号提取失败: {e}")
+            logger.error("信号提取失败: %s", e)
 
         return signals
 

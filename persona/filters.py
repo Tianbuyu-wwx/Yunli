@@ -4,6 +4,10 @@
 作为过滤逻辑的单一数据源，提供分层过滤接口。
 """
 
+# Darwin 进化后的过滤规则占位（运行时通过 overlay 动态生效）
+FILTER_RULES = """
+"""
+
 import re
 from typing import Tuple, Dict, List
 
@@ -100,6 +104,9 @@ for _action in ACTION_WORDS:
     if not _action.startswith("(") and not _action.startswith("（"):
         _ACTION_MARKED_PATTERNS.append(re.compile(rf"[\*<]\s*{_escaped}\s*[\*>]"))
 
+# 已加载的 overlay 动作词集合（避免重复编译）
+_LOADED_OVERLAY_ACTION_WORDS: set = set()
+
 # ========== 符号颜文字预编译模式 ==========
 _SYMBOL_KAOMOJI_RES = [re.compile(p, re.IGNORECASE) for p in SYMBOL_KAOMOJI_PATTERNS]
 
@@ -169,8 +176,47 @@ def filter_emoji(text: str) -> str:
     return ''.join(char for char in text if not is_emoji(char))
 
 
+def _load_overlay_action_words() -> List[str]:
+    """从运行时 overlay 加载进化后的过滤规则
+
+    overlay 文件格式：每行一个动作词，# 开头为注释。
+    """
+    try:
+        from ..evolution import asset_bridge
+        overlay_text = asset_bridge.get_runtime_overlay("filter_rules")
+        if not overlay_text:
+            return []
+    except (ImportError, OSError):
+        return []
+
+    words = []
+    for line in overlay_text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            words.append(line)
+    return words
+
+
 def filter_action_words(text: str) -> str:
-    """过滤文本中的动作描述词（使用预编译正则）"""
+    """过滤文本中的动作描述词（使用预编译正则 + 运行时 overlay）"""
+    # 动态加载 overlay 中的新动作词（无需 reload 模块即可生效）
+    for word in _load_overlay_action_words():
+        if word in _LOADED_OVERLAY_ACTION_WORDS:
+            continue
+        _LOADED_OVERLAY_ACTION_WORDS.add(word)
+        escaped = re.escape(word)
+        # 独立出现模式
+        if word.startswith("(") or word.startswith("（"):
+            _ACTION_INDEPENDENT_PATTERNS.append(re.compile(escaped))
+        else:
+            _ACTION_INDEPENDENT_PATTERNS.append(re.compile(
+                rf"(?<![\u4e00-\u9fa5a-zA-Z0-9]){escaped}"
+                r"(?![\u4e00-\u9fa5a-zA-Z0-9])"
+            ))
+        # *动作* / <动作> 标记模式（括号格式不需要）
+        if not word.startswith("(") and not word.startswith("（"):
+            _ACTION_MARKED_PATTERNS.append(re.compile(rf"[\*<]\s*{escaped}\s*[\*>]"))
+
     for pattern in _ACTION_MARKED_PATTERNS:
         text = pattern.sub("", text)
     for pattern in _ACTION_INDEPENDENT_PATTERNS:

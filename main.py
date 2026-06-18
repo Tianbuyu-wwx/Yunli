@@ -1,10 +1,24 @@
-import re
-import time
-import random
+"""云璃人格插件主入口（已重构）
+
+AstrBot 插件入口（@register），通过装饰器接收 AstrBot 框架事件，
+并把所有重业务委派给三个协作者类：
+
+  - YunliEventPipeline    LLM 请求前/响应后的事件管线
+  - YunliCommandHandler   /云璃 / /云璃语音 / /云璃资料 / /云璃帮助
+  - YunliEvolutionManager /云璃进化（Darwin 进化 + Phase 2 模式发现）
+
+本类仅保留 @register 装饰、初始化、共享 state、生命周期清理与装饰器
+委托方法（保持向后兼容：所有 self.plugin.xxx 接口对测试和框架可见）。
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+import random
+import time
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
@@ -20,24 +34,35 @@ from .core import (
     GroupPerception,
     MemoryManager,
     AtDetector,
-    RequestContext,
-    estimate_tokens,
-    truncate_at_sentence,
-    is_structured_summary,
 )
+from .core.thread_tracker import get_thread_tracker
+from .evolution.darwin_evolve import DarwinEvolution
+from .evolution.log_collector import LogCollector, InteractionLog
+from .evolution.pattern_discovery import PatternDiscovery
+from .evolution.rule_generator import RuleGenerator
+
+from .core.event_pipeline import YunliEventPipeline
+from .core.command_handler import YunliCommandHandler
+from .core.evolution_manager import YunliEvolutionManager
+from .core.metrics import Metrics
 
 
 @register(
     "astrbot_plugin_yunli_persona",
     "YunliDev",
     "云璃QQ群聊人格插件 - 让云璃成为你的群友",
-    "1.6.0",
-    "https://github.com/yourname/astrbot_plugin_yunli_persona",
+    "2.3.1",
+    "https://github.com/YunliDev/astrbot_plugin_yunli_persona",
 )
 class YunliPersonaPlugin(Star):
-    """云璃人格插件主类"""
+    """云璃人格插件主类（@register 装饰）
 
-    logger = logging.getLogger("YunliPlugin")
+    保持向后兼容：所有原 self.plugin.xxx 接口仍可被测试/框架访问。
+    重业务逻辑已迁出至 YunliEventPipeline / YunliCommandHandler /
+    YunliEvolutionManager 三个协作者类。
+    """
+
+    logger = logging.getLogger(__name__)
 
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -67,25 +92,28 @@ class YunliPersonaPlugin(Star):
         self.relationship = RelationshipManager(relationship_config)
         self.qq_behavior._relationship_manager = self.relationship
 
-        # 初始化消息切分器
+        # 初始化消息切分器（短消息策略：最多2段，每段80字）
         splitter_config = {
-            'max_segment_length': self.config.get('message_splitter_max_segment_length', 180),
+            'max_segment_length': self.config.get('message_splitter_max_segment_length', 80),
             'min_segment_length': self.config.get('message_splitter_min_segment_length', 10),
             'enable_typing_delay': self.config.get('message_splitter_enable_typing_delay', True),
-            'base_delay': self.config.get('message_splitter_base_delay', 0.5),
-            'delay_per_char': self.config.get('message_splitter_delay_per_char', 0.03),
-            'max_delay': self.config.get('message_splitter_max_delay', 3.0),
+            'base_delay': self.config.get('message_splitter_base_delay', 1.5),
+            'delay_per_char': self.config.get('message_splitter_delay_per_char', 0.04),
+            'max_delay': self.config.get('message_splitter_max_delay', 4.0),
             'enable_thinking_pause': self.config.get('message_splitter_enable_thinking_pause', True),
             'thinking_pause_prob': self.config.get('message_splitter_thinking_pause_prob', 0.3),
             'enable_natural_break': self.config.get('message_splitter_enable_natural_break', True),
+            'max_segments': self.config.get('message_splitter_max_segments', 2),
         }
         self.message_splitter = MessageSplitter(splitter_config)
 
-        # 消息防抖器（独立模块）
+        # 消息防抖器（独立模块）—— 回调需要 plugin 实例的 _on_debounce_flush
+        # 现在通过 self._event_pipeline._on_debounce_flush 转发（plugin 仍提供同名薄方法）
         self._debouncer = MessageDebouncer(
             debounce_seconds=self.config.get("message_debounce_seconds", 3.0),
             max_wait_seconds=self.config.get("message_debounce_max_wait", 8.0),
             on_flush=self._on_debounce_flush,
+            on_individual_message=self._on_individual_message,
         )
 
         # At 检测器（可缓存 self_id，测试可替换）
@@ -126,6 +154,29 @@ class YunliPersonaPlugin(Star):
         # 后台任务生命周期管理：保存所有 create_task 的引用，支持插件卸载时优雅清理
         self._background_tasks: Set[asyncio.Task] = set()
 
+        # Darwin 进化系统（延迟初始化 provider，在第一次使用时通过 context 获取）
+        self._darwin: Optional[DarwinEvolution] = None
+        self._darwin_last_trigger_time = 0.0
+
+        # Phase 2: 模式发现系统（延迟初始化 provider + log_collector）
+        self._log_collector: Optional[LogCollector] = None
+        self._pattern_discovery: Optional[PatternDiscovery] = None
+        self._rule_generator: Optional[RuleGenerator] = None
+
+        # 轻量级指标收集器（在 main_event / main_command / main_evolution 中埋点）
+        self.metrics = Metrics("yunli_plugin")
+
+        # 创建三个协作者实例（必须在所有共享 state 初始化之后）
+        self._event_pipeline = YunliEventPipeline(self)
+        self._command_handler = YunliCommandHandler(self)
+        self._evolution_manager = YunliEvolutionManager(self)
+
+        # 记忆维护定时任务配置（惰性启动，避免测试中协程未 await 警告）
+        self._memory_cleanup_interval = self.config.get("memory_cleanup_interval_seconds", 3600)
+        self._memory_maintenance_started = False
+
+    # ========== 后台任务管理 ==========
+
     def _safe_create_task(self, coro) -> asyncio.Task:
         """创建后台任务并跟踪生命周期
 
@@ -139,12 +190,57 @@ class YunliPersonaPlugin(Star):
         def _done_callback(t: asyncio.Task):
             self._background_tasks.discard(t)
             if not t.cancelled() and t.exception():
-                print(f"[云璃插件] 后台任务异常: {t.exception()}")
+                self.logger.error("后台任务异常", exc_info=t.exception())
 
         task.add_done_callback(_done_callback)
         return task
 
-    def _init_data(self):
+    async def _periodic_memory_maintenance(self):
+        """后台定时任务：定期清理过期记忆 + 衰减置信度 + 生成群聊摘要
+
+        每小时执行一次：
+        1. cleanup_expired：清理过期记忆、约定，衰减置信度
+        2. generate_group_summaries：为活跃群生成群聊摘要
+
+        P2-8 修复：添加重试上限和指数退避，避免连续失败导致日志爆炸
+        """
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        base_retry_delay = 60  # 基础重试延迟（秒）
+
+        while True:
+            try:
+                await asyncio.sleep(self._memory_cleanup_interval)
+                # 1. 清理过期记忆 + 置信度衰减
+                await asyncio.to_thread(self._memory_manager.cleanup_expired)
+                # 2. 生成群聊摘要
+                await self._memory_manager.generate_group_summaries()
+                # 成功则重置失败计数
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_failures += 1
+                # 指数退避：60s → 120s → 240s → 480s → 960s
+                retry_delay = min(
+                    base_retry_delay * (2 ** (consecutive_failures - 1)),
+                    3600,  # 最大 1 小时
+                )
+                self.logger.error(
+                    "记忆维护任务失败 (%d/%d): %s，%d 秒后重试",
+                    consecutive_failures, max_consecutive_failures, e, retry_delay,
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    self.logger.error(
+                        "记忆维护任务连续失败 %d 次，暂停本轮重试，等待下一周期",
+                        max_consecutive_failures,
+                    )
+                    consecutive_failures = 0
+                    await asyncio.sleep(self._memory_cleanup_interval)
+                else:
+                    await asyncio.sleep(retry_delay)
+
+    def _init_data(self) -> None:
         """初始化数据库数据"""
         # 检查是否已有数据
         dialogues = self.db.query_dialogues("greeting", limit=1)
@@ -155,511 +251,99 @@ class YunliPersonaPlugin(Star):
             )
             if data_path.exists():
                 self.db.import_from_json(str(data_path))
-                print("[云璃插件] 初始数据导入完成")
+                self.logger.info("初始数据导入完成")
             else:
-                print(f"[云璃插件] 警告：未找到初始数据文件 {data_path}")
+                self.logger.warning("未找到初始数据文件 %s", data_path)
+
+    # ========== @filter.on_llm_request / response 装饰器入口（委派给 EventPipeline） ==========
+
+    @filter.on_message(priority=1)
+    async def on_message(self, event: AstrMessageEvent):
+        """所有消息常驻监听：确保非@云璃的群聊消息也能被记录
+
+        P2-12 修复：原 on_llm_request 只在 AstrBot 调用 LLM 时触发，
+        导致非@消息无法进入旁听模式。新增 on_message handler，
+        每条消息都尝试记录，不管是否 @ 云璃。
+        """
+        # 惰性启动记忆维护定时任务（首次调用时启动）
+        if not self._memory_maintenance_started:
+            self._memory_maintenance_started = True
+            self._safe_create_task(self._periodic_memory_maintenance())
+        return await self._event_pipeline.on_message(event)
 
     @filter.on_llm_request(priority=50)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """在LLM请求前注入云璃人格提示词
-
-        Token预算：
-        - 基础提示词: ~500 Token
-        - 动态知识: 最多300 Token
-        - 关系上下文: 最多150 Token
-        - 群聊上下文: 最多200 Token
-        - 总计: ~1150 Token
-
-        消息防抖：同一scope（群号+用户ID）在窗口内的多条消息合并处理。
-        """
-        if not self._should_activate(event):
-            return
-
-        group_id = self._get_group_id(event)
-        user_id = self._get_user_id(event)
-        user_nickname = self._get_user_nickname(event)
-        scope = f"{group_id}:{user_id}" if group_id else user_id
-
-        # 创建请求上下文，附着在 event 上
-        ctx = RequestContext(
-            req=req,
-            group_id=group_id,
-            user_id=user_id,
-            user_nickname=user_nickname,
-            scope=scope,
-        )
-        event._yunli_ctx = ctx
-
-        # 消息防抖处理（由 MessageDebouncer 管理窗口和合并）
-        if await self._debouncer.handle_message(scope, event, req):
-            ctx.is_debounce_buffered = True
-            return
-
-        await self._inject_persona_prompt(event, req)
-        # 处理成功后才记录时间戳，防止超时失败影响下一条消息的防抖判断
-        self._debouncer.mark_processed(scope)
-
-    async def _on_debounce_flush(self, scope: str, event: AstrMessageEvent, req: ProviderRequest):
-        """防抖窗口到期后，处理合并后的消息"""
-        await self._inject_persona_prompt(event, req)
-
-    async def _inject_persona_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
-        """注入云璃人格提示词（带超时保护，防止慢查询阻塞LLM请求）"""
-        try:
-            await asyncio.wait_for(
-                self._do_inject_persona_prompt(event, req),
-                timeout=self._prompt_inject_timeout,
-            )
-        except asyncio.TimeoutError:
-            print(
-                f"[云璃插件] 提示词注入超时({self._prompt_inject_timeout}s)，"
-                f"跳过人格注入"
-            )
-        except Exception as e:
-            print(f"[云璃插件] 提示词注入失败: {e}")
-
-    def _batch_get_db_context(self, message: str, group_id: str, user_id: str, user_nickname: str) -> tuple:
-        """批量获取 DB 上下文（单线程内依次执行，减少 async 调度开销）
-
-        Returns:
-            (context_data, pending_loops, relationship_context)
-        """
-        context_data = self.persona_engine.get_context_data(message, group_id, user_id)
-        pending_loops = self.db.get_pending_loops(group_id, user_id, 2)
-        relationship_context = self._context_builder.add_relationship_context(
-            group_id, user_id, user_nickname, message, 150,
-        )
-        return context_data, pending_loops, relationship_context
-
-    async def _do_inject_persona_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
-        """注入云璃人格提示词（实际执行体）
-
-        三阶段设计：
-        Phase 1 — 纯内存运算（关系/情感/环境/场景）
-        Phase 2 — 并行 DB 查询（get_context_data + get_pending_loops + add_relationship_context）
-        Phase 3 — 组装提示词
-        """
-        # 从 event 读取请求上下文
-        ctx: RequestContext = getattr(event, '_yunli_ctx', None)
-        if ctx is None:
-            return  # 无上下文，跳过注入
-
-        # 标记合并状态：防抖器将此消息与其他消息合并后 flush
-        ctx.is_debounce_merged = ctx.is_debounce_buffered
-
-        # 防止重复注入：如果 req.system_prompt 已有内容（来自框架或其他插件），
-        # 检查是否已经包含云璃标记。如果没有，追加而非覆盖。
-        if ctx.is_prompt_injected:
-            return
-
-        base_prompt = self.persona_engine.build_system_prompt()
-        message = event.message_str or ""
-        group_id = ctx.group_id
-        user_id = ctx.user_id
-
-        # ═══ Phase 1: 纯内存运算 ═══
-        if group_id and user_id:
-            self.relationship.update(group_id, user_id, message)
-        if message:
-            user_intent = self.relationship.detect_user_intent(message)
-            emotion_trigger = self.relationship.INTENT_TO_EMOTION_TRIGGER.get(user_intent)
-            if emotion_trigger:
-                self.persona_engine.emotion.transition(emotion_trigger, message)
-
-        # Phase 1 续：环境感知 + 场景信号 + 群聊氛围（全部纯内存，<1ms）
-        env_context = self._context_builder.format_environment_perception()
-        scene_desc = ""
-        if self._enable_group_scene_perception and group_id:
-            signals = GroupPerception.extract_scene_signals(event)
-            scene_desc = GroupPerception.format_scene_description(signals)
-        atmosphere_text = self._group_perception.get_atmosphere_text(group_id)
-        user_nickname = ctx.user_nickname
-
-        # Phase 1 续：知识查询模式检测（基于用户消息，避免响应阶段重复计算）
-        ctx.is_knowledge_query = bool(
-            message
-            and self.persona_engine.language.detect_query_mode(message) == "knowledge_query"
-        )
-
-        # ═══ Phase 2: 批量 DB 查询（单次 to_thread，减少线程池争用） ═══
-        # 将三个独立查询（知识库 + 约定 + 关系上下文）打包到一次线程调用中执行
-        db_result = await asyncio.to_thread(
-            self._batch_get_db_context,
-            message, group_id, user_id, user_nickname,
-        )
-        context_data, pending_loops, relationship_context = db_result
-
-        # ═══ Phase 3: 组装提示词（全部纯内存） ═══
-        prompt_parts = [base_prompt]
-
-        # 3a. 环境感知 + 场景信号
-        if env_context:
-            prompt_parts.append(env_context)
-        if scene_desc:
-            prompt_parts.append(scene_desc)
-
-        # 3b. 动态知识
-        dynamic_prompt = self.persona_engine.build_dynamic_prompt(
-            context_data, token_budget=300
-        )
-        if dynamic_prompt:
-            prompt_parts.append(dynamic_prompt)
-
-        # 3c. 关系状态提示
-        if group_id and user_id:
-            rel_hint = self.relationship.get_hint(group_id, user_id)
-            if rel_hint:
-                prompt_parts.append(f"【注意】{rel_hint}")
-
-        # 3d. 关系上下文
-        if relationship_context:
-            prompt_parts.append(relationship_context)
-
-        # 3e. 群聊上下文
-        chat_context = self._context_builder.build_chat_context(
-            group_id, atmosphere_text, token_budget=200
-        )
-        if chat_context:
-            prompt_parts.append(chat_context)
-
-        # 3f. 未完成约定
-        if pending_loops:
-            loop_texts = []
-            for loop in pending_loops:
-                nickname = loop.get("user_nickname", "") or user_id[:4]
-                loop_texts.append(f"{nickname}之前说{loop['text']}")
-            if loop_texts:
-                prompt_parts.append(f"【待续】{'；'.join(loop_texts)}")
-
-        full_prompt = "\n\n".join(prompt_parts)
-
-        # 注入提示词（处理与其他插件共存的场景）
-        if req.system_prompt:
-            # 其他插件已注入提示词 → 在云璃标记之后追加
-            # 使用 [[YUNLI_BOUNDARY]] 标记作为分隔，方便后续追踪
-            req.system_prompt = f"{req.system_prompt}\n\n[[YUNLI_BOUNDARY]]\n{full_prompt}"
-        else:
-            req.system_prompt = full_prompt
-
-        ctx.is_prompt_injected = True
+        """LLM 请求前：注入云璃人格提示词（委派给 YunliEventPipeline）"""
+        return await self._event_pipeline.on_request(event, req)
 
     @filter.on_llm_response(priority=50)
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
-        """后处理LLM响应（含Token使用监控与分段发送）"""
-        if not response or not response.completion_text:
-            return
+        """LLM 响应后：拟人化/分段/Token 监控（委派给 YunliEventPipeline）"""
+        return await self._event_pipeline.on_response(event, response)
 
-        # 从 event 读取请求上下文
-        ctx: RequestContext = getattr(event, '_yunli_ctx', None)
-        if not ctx or not ctx.is_prompt_injected:
-            # 未注入云璃提示词 → 跳过云璃的后处理
-            # 注意：不能清空 response.completion_text，其他插件可能已注入自己的提示词并产生了响应
-            return
+    # ========== 防抖器回调（保留为实例方法供 MessageDebouncer 调用） ==========
 
-        # 检查是否是防抖合并中被跳过的消息
-        if ctx.is_debounce_merged:
-            response.completion_text = ""
-            return
-
-        message = event.message_str or ""
-        group_id = ctx.group_id
-        user_id = ctx.user_id
-        user_nickname = ctx.user_nickname
-
-        # 检测是否为知识查询模式
-        is_knowledge_query = ctx.is_knowledge_query
-        if not is_knowledge_query:
-            is_knowledge_query = is_structured_summary(response.completion_text or "")
-
-        # 保存原始响应全文（用于日志记录，避免记录截断/润色后的文本）
-        original_response = response.completion_text
-
-        # 应用人格润色（第一段，允许加语气词）
-        # skip_emotion=True: Phase 1 已完成情绪检测，不重复触发
-        text = self.persona_engine.polish_response(
-            original_response, message, is_first_segment=True, skip_emotion=True,
-        )
-
-        # 回复自审（检测助手腔/泄露内部状态/过长/重复标点）
-        text = self.persona_engine.review_response(text, is_knowledge_query=is_knowledge_query)
-
-        # QQ群聊特殊处理（知识查询模式下减少拟人化，保持内容清晰）
-        is_at_me = getattr(event, 'is_at_me', lambda: False)()
-        text = self.qq_behavior.format_for_qq(text, is_at_me, user_nickname)
-
-        # ========== 知识查询模式：完整输出，不切分（早退，跳过聊天模式所有处理） ==========
-        if is_knowledge_query:
-            max_len = self.config.get("knowledge_max_text_length", 4000)
-            if len(text) > max_len:
-                text = text[:max_len] + "…"
-            response.completion_text = text
-            self._log_token_usage(event, response)
-            self._safe_create_task(
-                self._log_interaction(group_id, user_id, user_nickname, message, original_response, "llm")
-            )
-            return
-
-        # ========== 聊天模式：后续处理 ==========
-
-        # 关系模式回复长度限制
-        if group_id and user_id:
-            rel_length_limit = self.relationship.get_reply_length_limit(group_id, user_id)
-            if rel_length_limit and len(text) > rel_length_limit:
-                truncate_pos = rel_length_limit
-                for i in range(rel_length_limit, max(rel_length_limit - 15, 0), -1):
-                    if i < len(text) and text[i] in '。！？.!?…':
-                        truncate_pos = i + 1
-                        break
-                text = text[:truncate_pos]
-
-        # 拟人化处理
-        if self.qq_behavior.should_skip_punctuation() and text.endswith("。"):
-            text = text[:-1]
-        text = self.qq_behavior.add_typing_pause(text)
-        text = self.qq_behavior.add_human_touches(text)
-
-        # 检查 AstrBot 是否启用了分段回复
-        segmented_enabled = self._is_segmented_reply_enabled()
-
-        if segmented_enabled and len(text) > self.message_splitter.max_segment_length:
-            segments = self._prepare_segments(text)
-            if segments:
-                response.completion_text = segments[0]['text']
-                if len(segments) > 1:
-                    try:
-                        self._safe_create_task(
-                            self._send_remaining_segments_with_sem(
-                                event, segments[1:], group_id, user_id, user_nickname, message
-                            )
-                        )
-                    except Exception as e:
-                        print(f"[云璃插件] 分段发送任务创建失败: {e}")
-        else:
-            response.completion_text = text
-
-        # Token使用监控
-        self._log_token_usage(event, response)
-
-        # 记录互动（使用原始响应全文，不记录截断/润色后的文本）
-        self._safe_create_task(
-            self._log_interaction(group_id, user_id, user_nickname, message, original_response, "llm")
-        )
-
-    async def _send_remaining_segments_with_sem(
-        self,
-        event: AstrMessageEvent,
-        segments: List[Dict],
-        group_id: str,
-        user_id: str,
-        user_nickname: str,
-        original_message: str,
+    async def _on_debounce_flush(
+        self, scope: str, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """发送剩余的片段（带信号量限制并发数）"""
-        async with self._segment_send_sem:
-            await self._send_remaining_segments(
-                event, segments, group_id, user_id, user_nickname, original_message
-            )
+        """防抖窗口到期后，处理合并后的消息（委派给 EventPipeline）"""
+        await self._event_pipeline._on_debounce_flush(scope, event, req)
 
-    async def _send_remaining_segments(
-        self,
-        event: AstrMessageEvent,
-        segments: List[Dict],
-        group_id: str,
-        user_id: str,
-        user_nickname: str,
-        original_message: str,
+    async def _on_individual_message(
+        self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """发送剩余的片段（模拟真人分段打字）
+        """防抖合并时，对每条原始消息单独触发记忆提取
 
-        注意：此函数通过 asyncio.create_task 被调用，内部不能直接使用 yield。
-        使用 event.send() 直接发送消息。
-        后续片段不再添加语气词，避免碎嘴。
-
-        segments 已由 _prepare_segments 预处理（含空段过滤和思考停顿）。
+        避免"我喜欢猫"+"我喜欢狗"合并后只提取出一条偏好。
+        仅执行轻量记忆提取，不注入人格提示词、不生成回复。
         """
-        # 检查事件是否仍然有效（插件卸载时事件可能已失效）
         try:
-            _ = getattr(event, 'message_str', None)
-        except Exception:
-            print(f"[云璃插件] 分段发送中止：事件已失效")
-            return
-
-        total_timeout = 30.0
-        start_time = time.time()
-
-        for seg_info in segments:
-            if time.time() - start_time >= total_timeout:
-                print(f"[云璃插件] 分段发送超时({total_timeout}s)，终止剩余 {len(segments)} 段")
-                break
-
-            delay = seg_info.get('delay', 0.5)
-            text = seg_info['text']
-
-            # 后续片段不再添加语气词（is_first_segment=False）
-            text = self.persona_engine.polish_response(text, original_message, is_first_segment=False)
-
-            if delay > 0:
-                await asyncio.sleep(min(delay, total_timeout - (time.time() - start_time)))
-
-            if text.strip():
-                try:
-                    await event.send(text)
-                except Exception as e:
-                    print(f"[云璃插件] 分段发送失败: {e}")
-                    break
-
-    def _is_segmented_reply_enabled(self) -> bool:
-        """检查 AstrBot 是否启用了分段回复"""
-        try:
-            # 从 AstrBot 配置中读取分段回复设置
-            if hasattr(self.context, 'config') and self.context.config:
-                platform_settings = getattr(self.context.config, 'platform_settings', None)
-                if platform_settings:
-                    segmented = platform_settings.get('segmented_reply', {})
-                    return segmented.get('enable', False)
-        except Exception:
-            pass
-
-        # 默认启用插件自身的分段逻辑（如果用户配置了的话）
-        return self.config.get('force_segmented_reply', True)
-
-    def _log_token_usage(self, event: AstrMessageEvent, response: LLMResponse):
-        """记录Token使用情况（采样记录）"""
-        try:
-            # 采样间隔（如 sample_rate=0.1 则每 10 条记录一次）
-            interval = max(1, int(1 / max(self._token_log_sample_rate, 0.01)))
-            self._token_log_counter += 1
-            should_log = (self._token_log_counter % interval == 0)
-            warn_interval = max(1, interval // 5)  # 高Token警告更频繁
-
-            system_prompt = ""
-            if hasattr(response, "system_prompt") and response.system_prompt:
-                system_prompt = response.system_prompt
-            elif hasattr(event, "system_prompt") and event.system_prompt:
-                system_prompt = event.system_prompt
-
-            system_tokens = len(system_prompt) // 2 if system_prompt else 0
-            response_tokens = (
-                len(response.completion_text) // 2 if response.completion_text else 0
-            )
-
-            # 高Token警告（不受采样率影响，但限制重复频率）
-            if system_tokens > 1200 and (self._token_log_counter % warn_interval == 0):
-                self.logger.warning(
-                    "Token使用过高：系统提示词 %d Token，建议优化",
-                    system_tokens,
+            group_id = self._get_group_id(event)
+            user_id = self._get_user_id(event)
+            user_nickname = self._get_user_nickname(event)
+            message = event.message_str or ""
+            if not group_id or not user_id or not message:
+                return
+            if self._memory_manager._lightweight_enabled:
+                self._memory_manager.extract_memory_lightweight(
+                    group_id, user_id, message, user_nickname
                 )
+        except Exception:
+            self.logger.debug("防抖单条消息记忆提取失败", exc_info=True)
 
-            if should_log:
-                self.logger.debug(
-                    "Token使用：系统 %d / 响应 %d / 合计 %d",
-                    system_tokens, response_tokens,
-                    system_tokens + response_tokens,
-                )
-
-        except Exception as e:
-            self.logger.debug("Token监控异常: %s", e)
+    # ========== @filter.command 装饰器入口（委派给 CommandHandler / EvolutionManager） ==========
 
     @filter.command("云璃")
     async def cmd_yunli(self, event: AstrMessageEvent):
-        """云璃命令 - 获取云璃的回应（含基本上下文感知）"""
-        message = event.message_str or ""
-        # 去除命令前缀
-        message = message.replace("/云璃", "").replace("云璃", "", 1).strip()
-        group_id = self._get_group_id(event)
-        user_id = self._get_user_id(event)
-
-        # 注入基本上下文（关系 + 记忆，不阻塞主流程）
-        context_meta = ""
-        if group_id and user_id:
-            try:
-                rel_hint = self.relationship.get_hint(group_id, user_id)
-                if rel_hint:
-                    context_meta += f" ({rel_hint.split('，')[0]})"
-            except Exception:
-                pass
-
-        if not message:
-            # 没有参数，返回随机台词
-            response = self.persona_engine.get_direct_response("你好" + context_meta)
-            if not response:
-                response = "嗯？叫我有什么事吗？"
-        else:
-            # 尝试获取直接响应
-            response = self.persona_engine.get_direct_response(message + context_meta)
-            if not response:
-                response = f"{message}？这是什么意思？"
-
-        # 润色
-        response = self.persona_engine.polish_response(response, message)
-        response = self.qq_behavior.format_for_qq(response)
-
-        # 命令响应统一走分段发送
-        async for result in self._send_segmented(event, response):
+        """/云璃 命令入口（委派给 YunliCommandHandler）"""
+        async for result in self._command_handler.cmd_yunli(event):
             yield result
 
     @filter.command("云璃语音")
     async def cmd_voice(self, event: AstrMessageEvent):
-        """获取云璃的语音台词"""
-        message = event.message_str or ""
-        line_type = None
-
-        # 解析参数
-        if "战斗" in message or "battle" in message:
-            line_type = "battle"
-        elif "技能" in message or "skill" in message:
-            line_type = "skill"
-        elif "胜利" in message or "victory" in message:
-            line_type = "victory"
-        elif "待机" in message or "idle" in message:
-            line_type = "idle"
-
-        voice_line = self.persona_engine.get_voice_line(line_type)
-        if voice_line:
-            response = voice_line
-        else:
-            response = "哼，现在不想说话。"
-
-        yield event.plain_result(response)
+        """/云璃语音 命令入口（委派给 YunliCommandHandler）"""
+        async for result in self._command_handler.cmd_voice(event):
+            yield result
 
     @filter.command("云璃资料")
     async def cmd_knowledge(self, event: AstrMessageEvent):
-        """查询云璃相关知识"""
-        message = event.message_str or ""
-        keyword = message.replace("/云璃资料", "").replace("云璃资料", "", 1).strip()
-
-        if not keyword:
-            yield event.plain_result("你要查什么？跟我说说看。")
-            return
-
-        # 查询知识库
-        knowledge = self.db.query_knowledge(keyword, limit=3)
-
-        if knowledge:
-            responses = []
-            for k in knowledge:
-                responses.append(f"【{k['entity_name']}】{k['description']}")
-            response = "\n".join(responses)
-        else:
-            response = f"关于'{keyword}'…我也不太清楚呢。你要不要教教我？"
-
-        # 知识查询结果统一走分段发送
-        async for result in self._send_segmented(event, response):
+        """/云璃资料 命令入口（委派给 YunliCommandHandler）"""
+        async for result in self._command_handler.cmd_knowledge(event):
             yield result
 
     @filter.command("云璃帮助")
     async def cmd_help(self, event: AstrMessageEvent):
-        """显示帮助信息"""
-        help_text = """【云璃插件帮助】
-/云璃 [内容] - 跟云璃说话
-/云璃语音 [类型] - 听云璃的台词（战斗/技能/胜利/待机）
-/云璃资料 [关键词] - 查询相关知识
-/云璃帮助 - 显示本帮助
+        """/云璃帮助 命令入口（委派给 YunliCommandHandler）"""
+        async for result in self._command_handler.cmd_help(event):
+            yield result
 
-也可以直接@我，我会回应你的~"""
+    @filter.command("云璃进化")
+    async def cmd_darwin(self, event: AstrMessageEvent):
+        """/云璃进化 命令入口（委派给 YunliEvolutionManager）"""
+        async for result in self._evolution_manager.cmd_darwin(event):
+            yield result
 
-        # 帮助文本较短，直接发送
-        yield event.plain_result(help_text)
+    # ========== 共享辅助方法（测试直接访问） ==========
 
     def _should_activate(self, event: AstrMessageEvent) -> bool:
         """判断是否激活云璃人格
@@ -685,8 +369,8 @@ class YunliPersonaPlugin(Star):
                     self._cached_self_id = str(getattr(account, "u", "") or "")
                     self._at_detector.set_self_id(self._cached_self_id)
                     return self._cached_self_id
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError):
+            self.logger.debug("获取 self_id 失败", exc_info=True)
         self._cached_self_id = ""
         return ""
 
@@ -694,31 +378,47 @@ class YunliPersonaPlugin(Star):
         """获取机器人自身QQ号（委托缓存版本）"""
         return self._get_cached_self_id()
 
-    # ========== 交互日志 ==========
+    def _get_group_id(self, event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_group_id())
+        except (AttributeError, TypeError, ValueError):
+            self.logger.debug("获取 group_id 失败", exc_info=True)
+            return ""
 
-    def _log_interaction(self, group_id, user_id, user_nickname, message, response, trigger_type):
-        """记录交互日志到记忆系统"""
-        emotion_state = self.persona_engine.emotion.current_state if hasattr(self.persona_engine, 'emotion') else ""
-        self._memory_manager.log_interaction(
-            group_id, user_id, user_nickname, message, response, trigger_type,
-            emotion_state=emotion_state,
-            on_atmosphere_update=self._group_perception.update_atmosphere,
-            on_topic_update=self._group_perception.detect_topic,
-        )
+    def _get_user_id(self, event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_sender_id())
+        except (AttributeError, TypeError, ValueError):
+            self.logger.debug("获取 user_id 失败", exc_info=True)
+            return ""
 
-        # 话题线程追踪（不阻塞主流程）
-        if self._enable_topic_threads and group_id and user_id:
-            self._group_perception.update_topic_threads(
-                group_id, user_id, user_nickname, message,
-                self._topic_thread_ttl_minutes, self._max_topic_threads,
-            )
+    def _get_user_nickname(self, event: AstrMessageEvent) -> str:
+        try:
+            return event.get_sender_name() or ""
+        except (AttributeError, TypeError, ValueError):
+            self.logger.debug("获取 sender_name 失败", exc_info=True)
+            return ""
 
-    # ========== 消息发送 ==========
+    def _is_segmented_reply_enabled(self) -> bool:
+        """检查 AstrBot 是否启用了分段回复"""
+        try:
+            # 从 AstrBot 配置中读取分段回复设置
+            if hasattr(self.context, 'config') and self.context.config:
+                platform_settings = getattr(self.context.config, 'platform_settings', None)
+                if platform_settings:
+                    segmented = platform_settings.get('segmented_reply', {})
+                    return segmented.get('enable', False)
+        except (AttributeError, TypeError, KeyError):
+            self.logger.debug("读取分段回复配置失败", exc_info=True)
+
+        # 默认启用插件自身的分段逻辑（如果用户配置了的话）
+        return self.config.get('force_segmented_reply', True)
 
     def _prepare_segments(self, text: str) -> List[Dict]:
-        """将文本切分为段（简化版）
+        """将文本切分为段（短消息策略：最多2段，段间衔接自然化）
 
         不再做空段过滤和 Markdown 检测，交由简化后的 MessageSplitter 处理。
+        第2段开头随机添加连接词，模拟真人补充说话的自然感。
         """
         segmented_enabled = self._is_segmented_reply_enabled()
         if not segmented_enabled or len(text) <= self.message_splitter.max_segment_length:
@@ -741,6 +441,17 @@ class YunliPersonaPlugin(Star):
                 )
                 if pause:
                     seg_text = seg_text + pause
+
+            # 段间衔接自然化：第2段开头随机加连接词（30%概率）
+            if i > 0 and random.random() < 0.3:
+                connectors = [
+                    "而且", "不过", "对了", "还有", "话说",
+                    "…不过", "…而且", "…对了",
+                ]
+                connector = random.choice(connectors)
+                # 避免重复：如果段首已有连接词则跳过
+                if not any(seg_text.startswith(c) for c in connectors):
+                    seg_text = connector + "，" + seg_text
 
             result.append({
                 "text": seg_text,
@@ -770,26 +481,46 @@ class YunliPersonaPlugin(Star):
             if seg_text.strip():
                 yield event.plain_result(seg_text)
 
-    def _get_group_id(self, event: AstrMessageEvent) -> str:
-        try:
-            return str(event.get_group_id())
-        except:
-            return ""
+    # ========== 交互日志（被 EventPipeline / Phase2 / 测试直接调用） ==========
 
-    def _get_user_id(self, event: AstrMessageEvent) -> str:
-        try:
-            return str(event.get_sender_id())
-        except:
-            return ""
+    async def _log_interaction(self, group_id, user_id, user_nickname, message, response, trigger_type, response_filtered=""):
+        """记录交互日志到记忆系统 + Phase2 日志采集
 
-    def _get_user_nickname(self, event: AstrMessageEvent) -> str:
-        try:
-            return event.get_sender_name() or ""
-        except:
-            return ""
+        异步方法：通过 asyncio.to_thread 将同步 DB 操作放到线程池，
+        避免阻塞事件循环，同时确保 _safe_create_task 能正确包装为协程。
+        """
+        emotion_state = self.persona_engine.emotion.current_state if hasattr(self.persona_engine, 'emotion') else ""
 
-    def __del__(self):
-        """清理资源：取消后台任务、刷新DB日志缓冲区、关闭连接"""
+        # 同步的 DB 操作放到线程池执行
+        await asyncio.to_thread(
+            self._memory_manager.log_interaction,
+            group_id, user_id, user_nickname, message, response, trigger_type,
+            emotion_state=emotion_state,
+            on_atmosphere_update=self._group_perception.update_atmosphere,
+            on_topic_update=self._group_perception.detect_topic,
+        )
+
+        # Phase 2: 对话日志采集（非阻塞，采样写入）
+        self._evolution_manager._get_log_collector().collect(InteractionLog(
+            group_id=group_id, user_id=user_id, user_nickname=user_nickname,
+            message=message, response_raw=response, response_filtered=response_filtered or response,
+            emotion_state=emotion_state, trigger_type=trigger_type,
+        ))
+
+        # 话题线程追踪（不阻塞主流程）
+        if self._enable_topic_threads and group_id and user_id:
+            self._group_perception.update_topic_threads(
+                group_id, user_id, user_nickname, message,
+                self._topic_thread_ttl_minutes, self._max_topic_threads,
+            )
+
+    # ========== 生命周期 ==========
+
+    async def close(self):
+        """显式清理资源：取消后台任务、刷新DB日志缓冲区、关闭连接
+
+        替代 __del__ 的可靠清理方式，应在插件卸载时显式调用。
+        """
         # 1. 取消所有未完成的后台任务
         for task in list(self._background_tasks):
             if not task.done():
@@ -800,8 +531,8 @@ class YunliPersonaPlugin(Star):
         if hasattr(self, "db") and hasattr(self.db, "flush_logs"):
             try:
                 self.db.flush_logs()
-            except Exception:
-                pass
+            except (OSError, RuntimeError):
+                self.logger.warning("close(): 刷新 DB 日志缓冲区失败", exc_info=True)
 
         # 3. 清空防抖缓冲区
         if hasattr(self, "_debouncer"):
@@ -811,5 +542,56 @@ class YunliPersonaPlugin(Star):
         if hasattr(self, "db"):
             try:
                 self.db.close()
-            except Exception:
+            except (OSError, RuntimeError):
+                self.logger.warning("close(): 关闭数据库连接失败", exc_info=True)
+
+        # 5. 输出运行期指标摘要（便于管理员在卸载时快速查看运行状况）
+        if hasattr(self, "metrics"):
+            try:
+                self.metrics.log_summary(self.logger)
+            except (OSError, RuntimeError, ValueError):
+                self.logger.debug("close(): 输出 metrics 摘要失败", exc_info=True)
+
+    def _cleanup_sync(self):
+        """同步清理核心逻辑（close 的非 async 子集，供 __del__ 复用）
+
+        close() 是 async 方法，__del__ 中无法 await。
+        此方法提取 close() 的同步清理步骤，避免维护两份重复代码。
+        """
+        # 1. 取消所有未完成的后台任务
+        for task in list(getattr(self, "_background_tasks", set())):
+            if not task.done():
+                task.cancel()
+        self._background_tasks.clear()
+
+        # 2. 刷新DB日志缓冲区
+        if hasattr(self, "db") and hasattr(self.db, "flush_logs"):
+            try:
+                self.db.flush_logs()
+            except (OSError, RuntimeError):
+                self.logger.debug("清理: 刷新 DB 日志缓冲区失败", exc_info=True)
+
+        # 3. 清空防抖缓冲区
+        if hasattr(self, "_debouncer"):
+            try:
+                self._debouncer.clear()
+            except (OSError, RuntimeError):
                 pass
+
+        # 4. 关闭数据库连接
+        if hasattr(self, "db"):
+            try:
+                self.db.close()
+            except (OSError, RuntimeError):
+                self.logger.debug("清理: 关闭数据库连接失败", exc_info=True)
+
+    def __del__(self):
+        """析构函数：尽力清理（不可靠，优先使用 close()）
+
+        简化版：仅执行同步清理子集，不输出 metrics 摘要（避免 __del__ 中
+        触发额外副作用）。所有异常静默处理，__del__ 绝不能抛异常。
+        """
+        try:
+            self._cleanup_sync()
+        except Exception:
+            pass  # __del__ 中绝对不能抛异常
